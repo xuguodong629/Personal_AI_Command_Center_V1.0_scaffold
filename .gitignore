@@ -34,3 +34,8 @@ frontend/tmp-pool/
 .env
 .env.*
 *.local
+
+# 生成的 API 契约快照（改一个路由就会变，不入库；需要时用
+#   curl http://127.0.0.1:8787/openapi.json -o openapi.json
+# 现场导出）
+openapi.json

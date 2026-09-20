@@ -39,6 +39,7 @@ interface Msg {
 
 interface Saved {
   persona: string;
+  style?: string;
   company: string;
   jd: string;
   messages: Msg[];
@@ -68,6 +69,13 @@ const PERSONAS = [
   { key: 'stress', label: '压力面' },
 ];
 
+/** 面试官风格：决定追问强度与是否纠缠数字口径（压力面也受"同主题最多连追 2 次"约束） */
+const STYLES = [
+  { key: 'standard', label: '标准', hint: '按 STAR 追问，每次只追一个点' },
+  { key: 'pragmatic', label: '务实型（推荐）', hint: '不纠缠口径，只问动作/范围/结果' },
+  { key: 'stress', label: '压力面', hint: '语气犀利，但仍限"同主题最多连追 2 次"' },
+];
+
 function loadSaved(): Partial<Saved> {
   try {
     const raw = localStorage.getItem(STORE_KEY);
@@ -88,6 +96,7 @@ export default function InterviewView({ settingsOpen, openSettings, pushToast }:
   const { providerId } = useProviders(settingsOpen);
 
   const [persona, setPersona] = useState(saved.persona || 'region_director');
+  const [style, setStyle] = useState(saved.style || 'pragmatic');
   const [company, setCompany] = useState(saved.company || '');
   const [jd, setJd] = useState(saved.jd || '');
   const [messages, setMessages] = useState<Msg[]>(saved.messages || []);
@@ -205,7 +214,7 @@ export default function InterviewView({ settingsOpen, openSettings, pushToast }:
 
   useEffect(() => {
     const data: Saved = {
-      persona, company, jd, messages, stage, roundNo, progress, finished,
+      persona, style, company, jd, messages, stage, roundNo, progress, finished,
       voiceOn, autoSubmit, proofread, continuous, bargeIn, silenceMs, sensitivity,
       showInterim, sessionId, title, tags, sideCollapsed, configCollapsed,
     };
@@ -217,7 +226,7 @@ export default function InterviewView({ settingsOpen, openSettings, pushToast }:
         void persist(sessionIdRef.current);
       }, 1200);
     }
-  }, [persona, company, jd, messages, stage, roundNo, progress, finished, voiceOn, autoSubmit, proofread, continuous, bargeIn, silenceMs, sensitivity, showInterim, sessionId, title, tags, sideCollapsed, configCollapsed]);
+  }, [persona, style, company, jd, messages, stage, roundNo, progress, finished, voiceOn, autoSubmit, proofread, continuous, bargeIn, silenceMs, sensitivity, showInterim, sessionId, title, tags, sideCollapsed, configCollapsed]);
 
   /** 确保存在工作区（没有就懒创建一个），返回 session id */
   const ensureSession = async (): Promise<string> => {
@@ -535,6 +544,7 @@ export default function InterviewView({ settingsOpen, openSettings, pushToast }:
         company,
         role_persona: persona,
         user_answer: userAnswer,
+        style,
       });
       if (!r.ok) {
         setErr(r.error || '面试请求失败');
@@ -666,6 +676,7 @@ export default function InterviewView({ settingsOpen, openSettings, pushToast }:
         jd,
         company,
         role_persona: persona,
+        style,
       });
       if (!r.ok) {
         setErr(r.error || '复盘生成失败');
@@ -800,6 +811,14 @@ export default function InterviewView({ settingsOpen, openSettings, pushToast }:
             <select className="input" value={persona} onChange={e => setPersona(e.target.value)}>
               {PERSONAS.map(p => (
                 <option key={p.key} value={p.key}>{p.label}</option>
+              ))}
+            </select>
+          </div>
+          <div className="field">
+            <label title={STYLES.find(s => s.key === style)?.hint}>面试官风格（追问强度）</label>
+            <select className="input" value={style} onChange={e => setStyle(e.target.value)}>
+              {STYLES.map(s => (
+                <option key={s.key} value={s.key}>{s.label} · {s.hint}</option>
               ))}
             </select>
           </div>

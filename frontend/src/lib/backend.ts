@@ -281,6 +281,8 @@ export interface InterviewTurnBody {
   company?: string;
   role_persona?: string;
   user_answer?: string;
+  /** 面试官风格：standard | pragmatic（不纠缠口径）| stress（压力面，仍受限） */
+  style?: string;
 }
 
 export interface InterviewTurnResult {
@@ -305,6 +307,7 @@ export function interviewReview(body: {
   jd?: string;
   company?: string;
   role_persona?: string;
+  style?: string;
 }): Promise<ApiResult<{ content: string; model: string }>> {
   return call('/api/ai/interview/review', { method: 'POST', body: JSON.stringify(body) });
 }

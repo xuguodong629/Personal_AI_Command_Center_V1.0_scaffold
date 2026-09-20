@@ -18,6 +18,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 
 from app.archive import save_report
+from app.channel import all_followups_text, analyze_text as channel_analyze_text, domains_text
 from app.industry import STAGES, evaluate as industry_evaluate, industry_queries, scan_stage
 from app.risk import RISK_DIMENSIONS, RiskFacts, evaluate as risk_evaluate, risk_queries
 from app.signals import (
@@ -2406,6 +2407,7 @@ class InterviewTurnRequest(BaseModel):
     company: str = ""
     role_persona: str = "hr"
     user_answer: str = ""
+    style: str = "standard"   # standard | pragmatic（不纠缠口径）| stress（压力面，仍受限）
 
 
 class InterviewReviewRequest(BaseModel):
@@ -2415,6 +2417,7 @@ class InterviewReviewRequest(BaseModel):
     jd: str = ""
     company: str = ""
     role_persona: str = "hr"
+    style: str = "standard"
 
 
 def _interview_advance(stage: str, round_no: int) -> tuple[str, int]:
@@ -2431,23 +2434,85 @@ def _interview_advance(stage: str, round_no: int) -> tuple[str, int]:
     return "done", 0
 
 
+def _asked_questions(history: list[ChatMessage], limit: int = 8) -> list[str]:
+    """从历史里抽取面试官**已经问过的问题**（确定性提取，用于硬性禁止重复提问）。"""
+    asked: list[str] = []
+    for m in history:
+        if m.role != "assistant":
+            continue
+        for line in (m.content or "").splitlines():
+            if "【提问】" in line:
+                q = line.split("【提问】", 1)[1].strip()
+                if q:
+                    asked.append(re.sub(r"\s+", " ", q)[:60])
+    return asked[-limit:]
+
+
+# 面试官风格：影响追问强度与口径纠缠程度
+INTERVIEW_STYLES = {
+    "standard": "标准面试官：按 STAR 追问，但每次只追一个点，同一主题最多连追 2 次。",
+    "pragmatic": ("务实型面试官：**不纠缠数字口径**。候选人报的数字，确认一次口径即可（谁的口径/含哪些），"
+                  "重点问「你做了什么动作、覆盖多大范围、带来什么结果」。绝不在同一个数字上追问超过 1 次。"),
+    "stress": ("压力面面试官：语气可以犀利、可以质疑，但**仍然受限**——同一主题最多连追 2 次，"
+               "且不得人身评价；追问必须针对事（口径/动作/结果），不得针对人。"),
+}
+
+
 def _interview_system(req: InterviewTurnRequest) -> str:
     persona = INTERVIEW_PERSONAS.get(req.role_persona, INTERVIEW_PERSONAS["hr"])
     stage_label = INTERVIEW_STAGE_LABELS.get(req.stage, req.stage)
+    style = INTERVIEW_STYLES.get(getattr(req, "style", "standard"), INTERVIEW_STYLES["standard"])
+    asked = _asked_questions(req.history)
+    asked_block = (
+        "【已经问过的问题（**严禁重复问同样的角度**；要回到旧话题必须换新角度并说明「换个角度再确认一下」）】\n"
+        + "\n".join(f"- {q}" for q in asked) + "\n"
+        if asked else ""
+    )
+    # 业务题库 + 套话检测（让面试官"懂业务"，能戳破空话）
+    biz_block = domains_text(req.stage, req.round_no, count=4)
+    analyze_block = channel_analyze_text(req.user_answer) if req.user_answer else ""
+    followup_block = all_followups_text() if biz_block else ""
+    ask_stage_rules = (
+        "【本轮是候选人的反问环节】以「公司对外可公开的信息」为界回答候选人的问题，"
+        "按三类作答：① 可以直接回答（区域目标、渠道结构、考核口径、汇报关系、作息与差旅）"
+        "② 需要 HR/业务负责人确认（薪资构成细节、编制、期权）"
+        "③ 不便透露（未公开的经营数据、客户名单）。\n"
+        "反问环节**不得反过来考核候选人**；候选人问得好的，应当正面认可。\n"
+        if req.stage == "ask" else ""
+    )
     return (
         f"你是【{persona}】，正在面试一位应聘「{req.company or '目标公司'}」"
-        f"「{req.jd[:60] or '区域/渠道管理岗'}」的候选人。\n"
+        f"「{req.jd[:60] or '区域/渠道管理岗'}」的候选人。你本人是**家电/厨电渠道操盘出身的老手**，"
+        "懂进销存、返利结构、单店模型、工程账期、窜货治理，最讨厌听到空话。\n"
         "【候选人画像（据此提问，禁止重复问画像里已有的信息）】\n"
         f"{req.profile.strip() or '（未提供）'}\n"
+        f"【你的面试风格】{style}\n"
         "【面试规则】\n"
         "1. 一次只问一个问题，口语化、简短（≤60 字），像真实面试。\n"
-        "2. 追问遵循 STAR：回答里缺数据、缺「你的具体动作」、缺结果时，必须追问其中一项。\n"
-        "3. 语气严格符合你的角色设定；不要客套长篇，不要替候选人编造经历。\n"
-        "4. 每轮先给≤3 句即时点评（亮点 / 缺失 / 建议），再给下一题；输出用如下两段式：\n"
+        "2. 追问遵循 STAR：回答缺数据、缺「你的具体动作」、缺结果时，追问其中一项。\n"
+        "3. **只用业务机制提问，禁止空问**（硬性）：你的问题必须落在四类之一——"
+        "**口径**（出货/回款/零售、个人/代理商/平台）、**结构**（渠道占比、客户集中度、型号梯队）、"
+        "**算法**（数字怎么算的、返利/补货/费用的规则）、**对价**（投入产出、毛利/费用率/ROI、账期/质保金/垫资/折让）。"
+        "严禁问「你怎么做的」「有什么成果」「怎么赋能的」这类谁都能糊过去的问题。\n"
+        "4. **遇到套话必须戳破**：对方用「赋能/闭环/抓手/打法/拉通/组合拳」等词替代具体机制时，"
+        "直接用业务问题追问对应机制（见下方业务题库与追问模板），并在点评里指出「这句需要落到具体机制」。\n"
+        "5. **追问配额（硬性）**：同一个主题（尤其是同一个数字/同一段经历）最多**连续追问 2 次**；"
+        "第 3 次必须换角度（换业务域或换到动作、背景、反思），并说「这个口径我先记下，后面按台账补」。\n"
+        "6. **口径优先**：候选人给出多口径数字（如「线上 1700 万」）时，第一个问题必须是**确认口径**"
+        "（这是谁的口径、包含哪些、你负责哪一段），而不是直接逼问细节；口径确认一次即可。\n"
+        "7. **不得否定全部**：某条数据口径不清，只针对那条数据提问，不得因此否定候选人的其他经历，也不要贴标签。\n"
+        "8. **候选人情绪或要求暂停时**：先用一句话放行（「这个问题我们先跳过，后面可以按台账补」或「好，那我们换个话题」），"
+        "再继续下一个话题；不得连续施压，不得评价候选人本人。\n"
+        "9. 每轮先给≤3 句即时点评（亮点 / 缺失 / 建议），再给下一题；输出用如下两段式：\n"
         "【点评】…（第一题没有候选人回答时可省略这一段）\n"
         "【提问】…\n"
-        "5. 不要透露这是模拟；不要输出题目编号以外的解释。\n"
-        f"6. 当前进度：{stage_label}（第 {req.round_no} 题）。"
+        "10. 不要透露这是模拟；不要输出题目编号以外的解释。\n"
+        f"{ask_stage_rules}"
+        f"{biz_block}"
+        f"{followup_block}"
+        f"{analyze_block}"
+        f"{asked_block}"
+        f"11. 当前进度：{stage_label}（第 {req.round_no} 题）。"
     )
 
 
@@ -2515,9 +2580,17 @@ def _interview_progress(stage: str, round_no: int) -> str:
 
 
 INTERVIEW_REVIEW_SYSTEM = (
-    "你是面试教练，负责为候选人做面试复盘。"
+    "你是家电/厨电渠道操盘出身的面试教练，负责为候选人做面试复盘。"
+    "你自己管过区域盘子（进销存、返利结构、单店模型、工程账期、窜货治理都熟），"
+    "**最看重业务含金量而不是话术**：一句空话不如一个具体数字，一段「赋能终端」不如一条台账规则。"
     "只依据提供的面试记录点评，不要编造候选人没说过的内容；"
+    "**客观描述行为与影响，绝对不做人格评判、不使用情绪化措辞**"
+    "（例如不要写「辱骂面试官」「情绪失控」「态度差」，改写为"
+    "「使用情绪化表达并中断了面试，导致第 5–12 题的信息无法采集」）。"
+    "**复盘要同时评估面试官的提问是否专业**——重复提问、同一数字连追三次以上、未先确认口径、"
+    "在候选人抗议后继续施压，都属于面试官的问题，必须单列出来，不能算到候选人头上。"
     "所有输出使用中文 Markdown，**全部用表格**，表格外最多一行说明。"
+    "复盘目的是让候选人下次能过，**禁止给出让人泄气的定性结论**，每条短板都要配可执行动作。"
 )
 
 
@@ -2536,12 +2609,30 @@ async def interview_review(req: InterviewReviewRequest):
     transcript = "\n".join(transcript_lines)[-12000:]
 
     persona = INTERVIEW_PERSONAS.get(req.role_persona, INTERVIEW_PERSONAS["hr"])
+    style = INTERVIEW_STYLES.get(getattr(req, "style", "standard"), INTERVIEW_STYLES["standard"])
+    asked = _asked_questions(req.history, limit=20)
+    asked_block = (
+        "\n【本次面试官实际问过的问题（用于评估**提问质量**：是否重复、是否在同一数字上连追）】\n"
+        + "\n".join(f"- {q}" for q in asked) + "\n"
+        if asked else ""
+    )
+    # 业务含金量：对候选人的每段回答做确定性检测（套话 / 数字 / 业务名词）
+    answer_blocks: list[str] = []
+    for i, m in enumerate([x for x in req.history if x.role == "user"], 1):
+        a = channel_analyze_text(m.content)
+        if a:
+            answer_blocks.append(f"——第 {i} 段回答 ——\n{a}")
+    biz_stats = "\n".join(answer_blocks)
     user = f"""面试官角色：{persona}
+面试官风格设定：{style}
 目标公司：{req.company or '（未指定）'}
 岗位 JD（节选）：{req.jd[:800] or '（未提供）'}
 
 候选人画像：
 {req.profile.strip() or '（未提供）'}
+{asked_block}
+【业务含金量检测（本地词库确定性统计，作为你评估"虚实"的硬依据，不得无视）】
+{biz_stats or '（无候选人回答可检测）'}
 
 面试记录（按时间顺序）：
 {transcript}
@@ -2550,12 +2641,18 @@ async def interview_review(req: InterviewReviewRequest):
 
 ## 表一 · 总评
 | 总分(0-100) | 等级 | 一句话结论 | 是否建议进入下一轮 | 最大亮点 | 最大短板 |
+- 总分**只按已作答的题目计算**，并在分数后注明（按 N 道已答题计）；面试中断后未进行的题目**不计 0 分**
+- 一句话结论必须包含「可训练点 + 下一步动作」
+- 短板描述只写行为与影响，不写人格评价
 
 ## 表二 · 逐题评分
-| 题号 | 面试官问题（简写） | 你的回答要点 | 内容完整(0-5) | STAR结构(0-5) | 数据支撑(0-5) | 表达条理(0-5) | 主要问题 |
+| 题号 | 面试官问题（简写） | 你的回答要点 | 内容完整(0-5) | 结构/STAR(0-5) | 数据支撑(0-5) | 表达条理(0-5) | 主要问题 |
+- 逐题必须覆盖记录里的每一道题；**未作答或面试中断后未进行的题，四个维度一律填「未进行」，主要问题写「面试中断（非能力缺失，需重练）」，不得填 0**
+- **反问环节（候选人反问）不用 STAR 评分**：结构列填「—」，数据支撑列按「业务关注度」评、表达条理列按「信息获取质量」评，主要问题写提问顺序是否合理（应先业务后薪资）
 
 ## 表三 · 更好的答法
 | 题号 | 你的原话（节选） | 改写示范 | 为什么更好 |
+- 改写示范要给出**可以直接背下来的口语版**（≤80 字），并写明口径如何处理
 
 ## 表四 · 风险暴露
 | 风险点 | 出现在的题目 | 面试官可能的疑虑 | 补救话术 |
@@ -2563,7 +2660,21 @@ async def interview_review(req: InterviewReviewRequest):
 ## 表五 · 训练清单
 | 优先级 | 要补强的地方 | 具体动作 | 练习素材/题目 |
 
-要求：逐题评分必须覆盖面试记录里的每一道题；没有的信息写「记录中未涉及」，不要臆造。"""
+## 表六 · 面试官提问方式评估
+| 面试官的做法 | 出现在的题目 | 是否专业 | 为什么 | 你下次可以怎么把话题拉回来 |
+- 逐条检查：① 是否重复问同一问题角度 ② 是否在同一数字/口径上连续追问 ≥3 次 ③ 是否**没有先确认口径**就逼细节
+  ④ 候选人表达情绪或要求暂停后是否继续施压 ⑤ 是否把反问环节当成考核
+- 若不专业，明确写「不专业」并给出应对话术；若专业，写「专业」并说明你该如何配合
+
+## 表七 · 业务含金量体检（渠道操盘视角，必须逐条覆盖已作答的题）
+| 题号 | 口径是否讲清（出货/回款/零售 · 个人/代理商/平台） | 结构是否讲清（渠道占比 · 客户集中度 · 型号梯队） | 机制与算法（数字怎么算 · 返利/补货/费用规则） | 风险与对价（账期/质保金/垫资/折让/毛利/费用率） | 可复制性（步骤/标准/节奏） | 套话命中词 | 业务化改写建议 |
+- 每格用「✅ 有 / ⚠️ 含糊 / ❌ 缺 / 未涉及」，后跟一句依据（引用候选人原话关键词）
+- 「套话命中词」必须使用上方**业务含金量检测**里统计出的词与次数，不得自己编
+- 「业务化改写建议」要给出一句把套话换成业务语言的示范（例：把「赋能终端」改成「给 17 家乡镇店做收旧台账+导购提成改按利润款 60 元/台」）
+- 最后附一行：**本次面试的套话率与最该补的一个业务域**（从十二域里点名：区域盘子与口径 / 渠道结构 / 经销商与返利 / 终端动销与单店模型 / 型号梯队 / 库存与现金 / 工程与 KA / 线上与渠道冲突 / 价格与促销费用 / 政策落地与节奏 / 团队与考核 / 渠道治理）
+
+要求：不要臆造；没有的信息写「记录中未涉及」。"""
+    user = re.sub(r"\n{3,}", "\n\n", user)
 
     r = await _llm_call(provider, [
         {"role": "system", "content": INTERVIEW_REVIEW_SYSTEM},

@@ -27,15 +27,26 @@ def main() -> int:
     rows = _extract_pool_rows(DEMO)
     print(f"解析条数：{len(rows)}（期望 3）")
     for r in rows:
-        print(f"  {r['company']} · {r['post']}")
-    keys = [f"{r['company']}·{r['post']}" for r in rows]
+        print(f"  {r.get('公司', '')} · {r.get('岗位', '')} ｜ 级={r.get('级', '')}")
+    keys = [f"{r.get('公司', '')}·{r.get('岗位', '')}" for r in rows]
     print("换一批排除串：", "；".join(keys))
     print("排除块预览：", _rows_block(rows).strip()[:80])
-    ok = len(rows) == 3 and rows[0]["company"] == "海信" and rows[0]["post"] == "区域经理"
-    # 解析不到表一时必须安全返回空（不阻断主流程）
-    empty_ok = _extract_pool_rows("没有表格的报告") == []
-    print(f"\n结果：{'PASS' if ok and empty_ok else 'FAIL'}（表一解析 {ok}；空输入安全 {empty_ok}）")
-    return 0 if (ok and empty_ok) else 1
+
+    # 逐项校验：整行结构（列名 → 单元格）必须完整可用
+    checks = {
+        "解析出 3 行": len(rows) == 3,
+        "公司列正确": rows[0].get("公司") == "海信",
+        "岗位列正确": rows[0].get("岗位") == "区域经理",
+        "风险标记列存在": "风险标记" in rows[0],
+        "JD 要点列存在": any("JD" in k for k in rows[0]),
+        "带括号的级能保留": rows[2].get("级", "").startswith("低"),
+        "空输入安全返回": _extract_pool_rows("没有表格的报告") == [],
+    }
+    for name, cond in checks.items():
+        print(f"  [{'PASS' if cond else 'FAIL'}] {name}")
+    ok = all(checks.values())
+    print(f"\n结果：{'PASS' if ok else 'FAIL'}")
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
