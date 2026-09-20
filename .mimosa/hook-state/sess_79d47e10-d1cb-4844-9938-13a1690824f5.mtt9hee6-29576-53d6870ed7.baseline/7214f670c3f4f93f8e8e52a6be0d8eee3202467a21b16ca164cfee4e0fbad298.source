@@ -1,0 +1,130 @@
+// 本地 FastAPI 后端客户端（模型直连：供应商配置 / 连接测试 / 对话）
+
+const BASE = localStorage.getItem('jc-backend-url') || 'http://127.0.0.1:8787';
+
+export interface ModelProvider {
+  id: string;
+  name: string;
+  base_url: string;
+  api_key: string;
+  model: string;
+}
+
+export type ApiResult<T> =
+  | ({ ok: true } & T)
+  | { ok: false; error: string };
+
+async function call<T>(path: string, init?: RequestInit): Promise<ApiResult<T>> {
+  try {
+    const res = await fetch(`${BASE}${path}`, {
+      headers: { 'Content-Type': 'application/json' },
+      ...init,
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok) {
+      const d = data as { detail?: unknown } | null;
+      const detail = typeof d?.detail === 'string' ? d.detail : `HTTP ${res.status}`;
+      return { ok: false, error: detail };
+    }
+    return data as ApiResult<T>;
+  } catch {
+    return {
+      ok: false,
+      error: '无法连接本地后端（127.0.0.1:8787）。请启动：cd backend && uvicorn app.main:app --port 8787',
+    };
+  }
+}
+
+export function fetchProviders(): Promise<ApiResult<{ providers: ModelProvider[] }>> {
+  return call('/api/providers');
+}
+
+export function saveProviders(providers: ModelProvider[]): Promise<ApiResult<{ providers: ModelProvider[] }>> {
+  return call('/api/providers', { method: 'POST', body: JSON.stringify({ providers }) });
+}
+
+export function testProvider(p: { base_url: string; api_key: string; model: string }): Promise<ApiResult<{ reply: string; latency_ms: number }>> {
+  return call('/api/providers/test', { method: 'POST', body: JSON.stringify(p) });
+}
+
+export interface ChatMsg {
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+}
+
+export function chat(providerId: string, messages: ChatMsg[]): Promise<ApiResult<{ content: string; model: string; latency_ms: number }>> {
+  return call('/api/ai/chat', {
+    method: 'POST',
+    body: JSON.stringify({ provider_id: providerId, messages }),
+  });
+}
+
+/** 联网搜索配置（直连模式的雷达 / 背调使用） */
+export type SearchEngine = 'none' | 'zhipu' | 'tavily';
+
+export interface SearchConfig {
+  engine: SearchEngine;
+  api_key: string;
+}
+
+export function fetchSearchConfig(): Promise<ApiResult<{ search: SearchConfig }>> {
+  return call('/api/search');
+}
+
+export function saveSearchConfig(cfg: SearchConfig): Promise<ApiResult<{ search: SearchConfig }>> {
+  return call('/api/search', { method: 'POST', body: JSON.stringify(cfg) });
+}
+
+export interface RadarInputs {
+  position_keywords: string;
+  regions: string;
+  industries: string;
+  resume_summary: string;
+  /** 候选人画像 + 优先级 + 底线 + 评分权重（评分依据） */
+  profile?: string;
+}
+
+/** 直连模式：定制简历（纯 LLM） */
+export function directResume(providerId: string, jobDescription: string, resumeText: string): Promise<ApiResult<{ content: string; model: string }>> {
+  return call('/api/ai/direct/resume', {
+    method: 'POST',
+    body: JSON.stringify({ provider_id: providerId, job_description: jobDescription, resume_text: resumeText }),
+  });
+}
+
+/** 直连模式：公司背调（多路搜索 + 汇总）；profile 为候选人底线（雇主风险核查透镜） */
+export function directBgcheck(providerId: string, companyName: string, profile?: string): Promise<ApiResult<{ content: string; model: string }>> {
+  return call('/api/ai/direct/bgcheck', {
+    method: 'POST',
+    body: JSON.stringify({ provider_id: providerId, company_name: companyName, profile: profile || '' }),
+  });
+}
+
+/** 直连模式：岗位雷达（多路搜索 + 评估分档） */
+export function directRadar(providerId: string, inputs: RadarInputs): Promise<ApiResult<{ content: string; model: string }>> {
+  return call('/api/ai/direct/radar', {
+    method: 'POST',
+    body: JSON.stringify({ provider_id: providerId, ...inputs }),
+  });
+}
+
+/** 深度分析模式：invest=投资视角 VC 五步 / screen=优秀企业筛选 6 步 */
+export type DeepMode = 'invest' | 'screen';
+
+/** 直连模式：深度分析（基于雷达机会池，按画像执行） */
+export function directDeep(providerId: string, mode: DeepMode, radarResult: string, profile?: string): Promise<ApiResult<{ content: string; model: string }>> {
+  return call('/api/ai/direct/deep', {
+    method: 'POST',
+    body: JSON.stringify({ provider_id: providerId, mode, radar_result: radarResult, profile: profile || '' }),
+  });
+}
+
+/** 常见模型服务的正确预置参数（base_url 是最常见的出错点） */
+export const PRESETS: Array<{ label: string; base_url: string; model: string }> = [
+  { label: '智谱 GLM', base_url: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-4.5-air' },
+  { label: 'DeepSeek', base_url: 'https://api.deepseek.com/v1', model: 'deepseek-chat' },
+  { label: 'Ollama 本地（免费）', base_url: 'http://localhost:11434/v1', model: 'qwen3.5:4b' },
+  { label: 'Moonshot Kimi', base_url: 'https://api.moonshot.cn/v1', model: 'kimi-k2-0905-preview' },
+  { label: '阿里通义 Qwen', base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus' },
+  { label: '自定义（OpenAI 兼容）', base_url: '', model: '' },
+];

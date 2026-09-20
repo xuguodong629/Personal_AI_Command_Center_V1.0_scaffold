@@ -1,0 +1,175 @@
+import { useEffect, useState } from 'react';
+import { ClipboardPaste, FileText, Sparkles } from 'lucide-react';
+import EnginePicker, { type Engine } from '../components/EnginePicker';
+import ResultPanel from '../components/ResultPanel';
+import { pickOutput, runWorkflow, type DifyConfig } from '../lib/dify';
+import { directResume } from '../lib/backend';
+import { useProviders } from '../lib/useProviders';
+import { useElapsed } from '../lib/useElapsed';
+import { readClipboard } from '../lib/utils';
+
+const JD_KEY = 'jc-resume-jd';
+const RESUME_KEY = 'jc-resume-json';
+
+interface Props {
+  cfg: DifyConfig;
+  settingsOpen: boolean;
+  openSettings: () => void;
+  pushToast: (kind: 'ok' | 'err' | 'info', msg: string) => void;
+}
+
+export default function ResumeView({ cfg, settingsOpen, openSettings, pushToast }: Props) {
+  const [jd, setJd] = useState(() => localStorage.getItem(JD_KEY) || '');
+  const [resumeJson, setResumeJson] = useState(() => localStorage.getItem(RESUME_KEY) || '');
+  const [defaultSummary, setDefaultSummary] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [result, setResult] = useState('');
+  const elapsed = useElapsed(busy);
+  const { providers, providerId, select } = useProviders(settingsOpen);
+  // V0.3：默认直连模型（独立运行，不再默认依赖 Dify）；如需 Dify 工作流可在页面顶部手动切换
+  const [engine, setEngine] = useState<Engine>('direct');
+
+  useEffect(() => {
+    localStorage.setItem('jc-engine-resume', engine);
+  }, [engine]);
+
+  // 输入持久化：切换视图或刷新后不丢
+  useEffect(() => { localStorage.setItem(JD_KEY, jd); }, [jd]);
+  useEffect(() => { localStorage.setItem(RESUME_KEY, resumeJson); }, [resumeJson]);
+
+  // 与岗位雷达共用同一份本地个人默认值，作为简历兜底
+  useEffect(() => {
+    fetch('/config/local-defaults.json')
+      .then(r => (r.ok ? r.json() : Promise.reject(new Error(String(r.status)))))
+      .then((d: { resume_summary?: string }) => setDefaultSummary(d.resume_summary || ''))
+      .catch(() => { /* ignore */ });
+  }, []);
+
+  const pasteJd = async () => {
+    const text = await readClipboard();
+    if (text === null) {
+      pushToast('err', '浏览器拒绝了剪贴板读取，请手动粘贴');
+      return;
+    }
+    setJd(text);
+    pushToast('ok', '已从剪贴板粘贴 JD');
+  };
+
+  const run = async () => {
+    if (!jd.trim()) {
+      pushToast('err', '请先粘贴岗位 JD');
+      return;
+    }
+    setBusy(true);
+    setErr('');
+    try {
+      if (engine === 'dify') {
+        if (!cfg.resumeKey) {
+          openSettings();
+          pushToast('err', '请先填写「AI 猎头中枢」的 API Key');
+          return;
+        }
+        const r = await runWorkflow(cfg.baseUrl, cfg.resumeKey, {
+          job_description: jd,
+          resume_json: resumeJson || defaultSummary,
+        });
+        if (!r.ok) {
+          setErr(r.error || '运行失败');
+          return;
+        }
+        // AI 猎头中枢有两个 end：result=匹配 JSON，high_match_report=定制简历
+        setResult(pickOutput(r.outputs, ['high_match_report', 'result', 'text']));
+        pushToast('ok', '定制简历已生成');
+      } else {
+        if (!providerId) {
+          openSettings();
+          pushToast('err', '请先在设置 → 模型直连中添加并选择模型');
+          return;
+        }
+        const r = await directResume(providerId, jd, resumeJson || defaultSummary);
+        if (!r.ok) {
+          setErr(r.error || '运行失败');
+          return;
+        }
+        setResult(r.content);
+        pushToast('ok', '定制简历已生成（直连模式）');
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const phase = elapsed < 30 ? '解析 JD 与岗位要求…' : elapsed < 60 ? '六维匹配度计算中…' : '撰写一岗一版定制简历…';
+
+  return (
+    <div className="view">
+      <header className="view-head">
+        <h2>定制简历</h2>
+        <p>粘贴岗位 JD，六维匹配分析后生成一岗一版的定制简历。</p>
+      </header>
+
+      <section className="card">
+        <EnginePicker
+          engine={engine}
+          onEngine={setEngine}
+          providers={providers}
+          providerId={providerId}
+          onProvider={select}
+          openSettings={openSettings}
+          directHint="纯模型调用，无需联网搜索"
+        />
+        <div className="field">
+          <div className="field-row">
+            <label>岗位 JD（从机会池复制，或手动粘贴）</label>
+            <button className="btn btn-ghost btn-sm" onClick={pasteJd}>
+              <ClipboardPaste size={13} /> 从剪贴板粘贴
+            </button>
+          </div>
+          <textarea
+            className="input"
+            rows={6}
+            value={jd}
+            onChange={e => setJd(e.target.value)}
+            placeholder="粘贴 JD 全文…"
+          />
+        </div>
+        <div className="field">
+          <label>简历 JSON 或摘要（留空则使用本地默认简历）</label>
+          <textarea
+            className="input"
+            rows={4}
+            value={resumeJson}
+            onChange={e => setResumeJson(e.target.value)}
+            placeholder="留空则使用 public/config/local-defaults.json 中的简历摘要"
+          />
+        </div>
+        <div className="form-actions">
+          <button className="btn btn-primary" onClick={run} disabled={busy}>
+            {busy ? <FileText size={15} className="spin-once" /> : <Sparkles size={15} />}
+            {busy ? `生成中 · 已用 ${elapsed}s` : '生成定制简历'}
+          </button>
+          <span className="form-hint">JD 解析 + 六维匹配 · 约 1 分钟</span>
+        </div>
+        {err && <div className="callout callout-err">{err}</div>}
+      </section>
+
+      {busy && (
+        <section className="progress">
+          <span>{phase}</span>
+          <div className="pbar"><i /></div>
+        </section>
+      )}
+
+      {!busy && result && <ResultPanel title="定制简历" text={result} badge="一岗一版" />}
+
+      {!busy && !result && (
+        <div className="empty">
+          <div className="empty-icon"><FileText size={20} /></div>
+          <b>还没有定制简历</b>
+          <p>粘贴目标岗位的 JD 全文，点击「生成定制简历」。<br />留空简历栏时，将自动使用本地默认简历摘要。</p>
+        </div>
+      )}
+    </div>
+  );
+}

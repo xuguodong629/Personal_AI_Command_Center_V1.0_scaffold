@@ -1,0 +1,268 @@
+import { useEffect, useState } from 'react';
+import { ArrowRight, ClipboardCheck, Radar as RadarIcon, Search, Sparkles, TrendingUp } from 'lucide-react';
+import ChipInput from '../components/ChipInput';
+import EnginePicker, { type Engine } from '../components/EnginePicker';
+import ResultPanel from '../components/ResultPanel';
+import { pickOutput, runWorkflow, type DifyConfig } from '../lib/dify';
+import { directRadar, directDeep } from '../lib/backend';
+import { useProviders } from '../lib/useProviders';
+import { useElapsed } from '../lib/useElapsed';
+import { loadLocalDefaults, buildCandidatePrompt } from '../lib/profile';
+import type { ViewId } from '../lib/views';
+
+// 通用默认值。个人简历摘要等敏感信息放在 public/config/local-defaults.json
+// （已在 .gitignore 中忽略），页面加载时自动合并，缺失时留空由用户填写。
+const DEFAULTS = {
+  position_keywords: '区域经理 渠道经理 渠道销售 区域销售 大客户销售',
+  regions: '河南 郑州 武汉 西安 上海 深圳 杭州 北京 成都',
+  industries: '家电 智能家居 新能源 储能 机器人 工业自动化 智能制造 SaaS 企业服务 消费电子',
+  resume_summary: '',
+};
+
+const INPUTS_KEY = 'jc-radar-inputs';
+
+function loadInputs(): typeof DEFAULTS {
+  try {
+    const raw = localStorage.getItem(INPUTS_KEY);
+    if (raw) return { ...DEFAULTS, ...(JSON.parse(raw) as Partial<typeof DEFAULTS>) };
+  } catch { /* ignore */ }
+  return DEFAULTS;
+}
+
+interface Props {
+  cfg: DifyConfig;
+  settingsOpen: boolean;
+  radarResult: string;
+  setRadarResult: (s: string) => void;
+  goTo: (v: ViewId) => void;
+  openSettings: () => void;
+  pushToast: (kind: 'ok' | 'err' | 'info', msg: string) => void;
+}
+
+export default function RadarView({ cfg, settingsOpen, radarResult, setRadarResult, goTo, openSettings, pushToast }: Props) {
+  const [inputs, setInputs] = useState(loadInputs);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [investing, setInvesting] = useState(false);
+  const [investResult, setInvestResult] = useState('');
+  const [investErr, setInvestErr] = useState('');
+  const [screening, setScreening] = useState(false);
+  const [screenResult, setScreenResult] = useState('');
+  const [screenErr, setScreenErr] = useState('');
+  const elapsed = useElapsed(busy);
+  const { providers, providerId, select } = useProviders(settingsOpen);
+  // V0.3：默认直连模型（独立运行，不再默认依赖 Dify）；如需 Dify 工作流可在页面顶部手动切换
+  const [engine, setEngine] = useState<Engine>('direct');
+  // 候选人画像提示词（local-defaults.json → buildCandidatePrompt），作为后端评分依据
+  const [profile, setProfile] = useState('');
+
+  useEffect(() => {
+    localStorage.setItem('jc-engine-radar', engine);
+  }, [engine]);
+
+  // 输入持久化：切换视图或刷新后不丢
+  useEffect(() => {
+    localStorage.setItem(INPUTS_KEY, JSON.stringify(inputs));
+  }, [inputs]);
+
+  // 加载本地个人默认值（public/config/local-defaults.json，不入库）：填充空字段 + 生成画像提示词
+  useEffect(() => {
+    loadLocalDefaults().then(d => {
+      setProfile(buildCandidatePrompt(d));
+      setInputs(prev => ({
+        position_keywords: prev.position_keywords || d.position_keywords || '',
+        regions: prev.regions || d.regions || '',
+        industries: prev.industries || d.industries || '',
+        resume_summary: prev.resume_summary || d.resume_summary || '',
+      }));
+    });
+  }, []);
+
+  const set = (patch: Partial<typeof DEFAULTS>) => setInputs(prev => ({ ...prev, ...patch }));
+
+  const run = async () => {
+    if (!inputs.resume_summary.trim()) {
+      pushToast('err', '请先填写简历摘要');
+      return;
+    }
+    setBusy(true);
+    setErr('');
+    try {
+      if (engine === 'dify') {
+        if (!cfg.radarKey) {
+          openSettings();
+          pushToast('err', '请先填写「岗位雷达」的 API Key');
+          return;
+        }
+        const r = await runWorkflow(cfg.baseUrl, cfg.radarKey, inputs);
+        if (!r.ok) {
+          setErr(r.error || '运行失败');
+          return;
+        }
+        setRadarResult(pickOutput(r.outputs, ['opportunity_pool', 'text']));
+        pushToast('ok', '机会池已更新');
+      } else {
+        if (!providerId) {
+          openSettings();
+          pushToast('err', '请先在设置 → 模型直连中添加并选择模型');
+          return;
+        }
+        const r = await directRadar(providerId, { ...inputs, profile });
+        if (!r.ok) {
+          setErr(r.error || '运行失败');
+          return;
+        }
+        setRadarResult(r.content);
+        pushToast('ok', '机会池已生成（直连模式）');
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const runDeep = async (mode: 'invest' | 'screen') => {
+    if (engine !== 'direct' || !providerId) {
+      openSettings();
+      pushToast('err', '深度分析需要直连模型，请先在设置 → 模型直连中添加并选择模型');
+      return;
+    }
+    if (mode === 'invest') {
+      setInvesting(true);
+      setInvestErr('');
+    } else {
+      setScreening(true);
+      setScreenErr('');
+    }
+    try {
+      const r = await directDeep(providerId, mode, radarResult, profile);
+      if (!r.ok) {
+        if (mode === 'invest') setInvestErr(r.error || '分析失败');
+        else setScreenErr(r.error || '分析失败');
+        return;
+      }
+      if (mode === 'invest') {
+        setInvestResult(r.content);
+        pushToast('ok', '潜力企业分析已生成（VC 五步）');
+      } else {
+        setScreenResult(r.content);
+        pushToast('ok', '优秀企业筛选已生成（6 步）');
+      }
+    } finally {
+      if (mode === 'invest') setInvesting(false);
+      else setScreening(false);
+    }
+  };
+
+  const phase = elapsed < 30 ? '并行检索 8 路岗位信息…' : elapsed < 70 ? 'AI 评估推荐度与匹配度…' : '汇总机会池，即将完成…';
+
+  return (
+    <div className="view">
+      <header className="view-head">
+        <h2>岗位雷达</h2>
+        <p>并行检索招聘平台 / 领英 / 企业官网机会，优先外企与 500 强；评估五险一金保障，并排查疑似刷 KPI 岗位。</p>
+      </header>
+
+      <section className="card">
+        <EnginePicker
+          engine={engine}
+          onEngine={setEngine}
+          providers={providers}
+          providerId={providerId}
+          onProvider={select}
+          openSettings={openSettings}
+          directHint="未配搜索引擎时输出方向性建议（含企业质量 / 福利 / 刷量核查维度）"
+        />
+        <div className="form-grid">
+          <div className="field">
+            <label>岗位关键词</label>
+            <ChipInput value={inputs.position_keywords} onChange={v => set({ position_keywords: v })} placeholder="输入后回车添加" />
+          </div>
+          <div className="field">
+            <label>目标区域</label>
+            <ChipInput value={inputs.regions} onChange={v => set({ regions: v })} placeholder="输入后回车添加" />
+          </div>
+          <div className="field">
+            <label>目标行业</label>
+            <ChipInput value={inputs.industries} onChange={v => set({ industries: v })} placeholder="输入后回车添加" />
+          </div>
+        </div>
+        <div className="field">
+          <label>简历摘要</label>
+          <textarea
+            className="input"
+            rows={4}
+            value={inputs.resume_summary}
+            onChange={e => set({ resume_summary: e.target.value })}
+            placeholder="填写你的简历摘要（可放入 public/config/local-defaults.json 自动加载）"
+          />
+        </div>
+        <div className="form-actions">
+          <button className="btn btn-primary" onClick={run} disabled={busy}>
+            {busy ? <Search size={15} className="spin-once" /> : <RadarIcon size={15} />}
+            {busy ? `搜索中 · 已用 ${elapsed}s` : '开始搜索'}
+          </button>
+          <span className="form-hint">8 路并行 · 约 1–2 分钟</span>
+        </div>
+        {err && <div className="callout callout-err">{err}</div>}
+      </section>
+
+      {busy && (
+        <section className="progress">
+          <Sparkles size={16} className="accent" />
+          <span>{phase}</span>
+          <div className="pbar"><i /></div>
+        </section>
+      )}
+
+      {!busy && radarResult && (
+        <ResultPanel
+          title="今日机会池"
+          text={radarResult}
+          badge="岗位雷达"
+          footer={
+            <div className="next-steps">
+              <button className="btn btn-ghost btn-sm" onClick={() => goTo('bg')}>
+                下一步：公司背调 <ArrowRight size={13} />
+              </button>
+              <button className="btn btn-ghost btn-sm" onClick={() => goTo('resume')}>
+                下一步：定制简历 <ArrowRight size={13} />
+              </button>
+            </div>
+          }
+        />
+      )}
+
+      {!busy && radarResult && engine === 'direct' && providerId && (
+        <section className="card">
+          <div className="form-actions">
+            <button className="btn btn-primary" onClick={() => runDeep('invest')} disabled={investing || screening}>
+              {investing ? <Sparkles size={15} className="spin-once" /> : <TrendingUp size={15} />}
+              {investing ? '投资视角分析中…' : '投资视角 · 潜力企业深挖'}
+            </button>
+            <button className="btn btn-primary" onClick={() => runDeep('screen')} disabled={investing || screening}>
+              {screening ? <Sparkles size={15} className="spin-once" /> : <ClipboardCheck size={15} />}
+              {screening ? '筛选分析中…' : '优秀企业筛选（6 步）'}
+            </button>
+            <span className="form-hint">按画像执行深度分析：投资逻辑选潜力股 / 6 步评估筛好企业</span>
+          </div>
+        </section>
+      )}
+      {investErr && <div className="callout callout-err">{investErr}</div>}
+      {screenErr && <div className="callout callout-err">{screenErr}</div>}
+      {!busy && !investing && investResult && (
+        <ResultPanel title="投资视角 · 潜力企业深挖" text={investResult} badge="VC 投委会" />
+      )}
+      {!busy && !screening && screenResult && (
+        <ResultPanel title="优秀企业筛选 · 6 步评估" text={screenResult} badge="筛选评估" />
+      )}
+
+      {!busy && !radarResult && (
+        <div className="empty">
+          <div className="empty-icon"><RadarIcon size={20} /></div>
+          <b>还没有机会池</b>
+          <p>确认上方三组关键词与简历摘要后，点击「开始搜索」。<br />机会池生成后，可直接把意向岗位的 JD 送往下两步继续分析。</p>
+        </div>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,36 @@
+# 依赖与构建产物
+node_modules/
+dist/
+
+# Tauri 桌面端
+frontend/src-tauri/target/
+frontend/src-tauri/gen/
+
+# Python 后端
+.venv/
+venv/
+__pycache__/
+
+# 运行时数据（实施计划 §七.4 的 data 目录约定）
+# 默认全部忽略，仅保留各目录的 README.md 说明（详见 docs/数据存储约定.md）
+data/*
+!data/*/
+data/*/*
+!data/*/README.md
+
+# 本地个人配置：简历摘要等敏感信息，不入库
+frontend/public/config/
+
+# 日志与临时文件
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# 前端自检用的编译产物（pool 展示逻辑单测）
+frontend/tmp-pool/
+
+# 环境变量与密钥
+.env
+.env.*
+*.local

@@ -1,0 +1,178 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Bot, Eraser, Send } from 'lucide-react';
+import Markdown from '../components/Markdown';
+import { chat, fetchProviders, type ChatMsg, type ModelProvider } from '../lib/backend';
+
+const HISTORY_KEY = 'jc-chat-history';
+const HISTORY_CAP = 60;
+
+function loadHistory(): ChatMsg[] {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY);
+    if (raw) {
+      const list = JSON.parse(raw) as ChatMsg[];
+      return Array.isArray(list) ? list.slice(-HISTORY_CAP) : [];
+    }
+  } catch { /* ignore */ }
+  return [];
+}
+
+interface Props {
+  /** 设置弹窗是否打开：关闭时重新拉取模型列表 */
+  settingsOpen: boolean;
+  openSettings: () => void;
+  pushToast: (kind: 'ok' | 'err' | 'info', msg: string) => void;
+}
+
+export default function ChatView({ settingsOpen, openSettings, pushToast }: Props) {
+  const [providers, setProviders] = useState<ModelProvider[] | null>(null);
+  const [providerId, setProviderId] = useState(() => localStorage.getItem('jc-chat-provider') || '');
+  const [messages, setMessages] = useState<ChatMsg[]>(loadHistory);
+  const [input, setInput] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  const refresh = useCallback(() => {
+    fetchProviders().then(r => {
+      const list = r.ok && r.providers ? r.providers : [];
+      setProviders(list);
+      setProviderId(cur => (list.some(p => p.id === cur) ? cur : list[0]?.id ?? ''));
+    });
+  }, []);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  // 设置弹窗每次关闭后刷新，让新增的模型立即可选
+  const sawOpen = useRef(false);
+  useEffect(() => {
+    if (settingsOpen) {
+      sawOpen.current = true;
+      return;
+    }
+    if (sawOpen.current) {
+      sawOpen.current = false;
+      refresh();
+    }
+  }, [settingsOpen, refresh]);
+
+  useEffect(() => {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(messages.slice(-HISTORY_CAP)));
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  }, [messages]);
+
+  const selectProvider = (id: string) => {
+    setProviderId(id);
+    localStorage.setItem('jc-chat-provider', id);
+  };
+
+  const send = async () => {
+    const text = input.trim();
+    if (!text || busy) return;
+    if (!providerId) {
+      pushToast('err', '请先在设置 → 模型直连中添加模型');
+      return;
+    }
+    const next: ChatMsg[] = [...messages, { role: 'user', content: text }];
+    setMessages(next);
+    setInput('');
+    setBusy(true);
+    setErr('');
+    const r = await chat(providerId, next);
+    setBusy(false);
+    if (!r.ok) {
+      setErr(r.error);
+    } else if (r.content) {
+      setMessages([...next, { role: 'assistant', content: r.content }]);
+    } else {
+      setErr('模型返回了空内容');
+    }
+  };
+
+  const selected = providers?.find(p => p.id === providerId);
+
+  return (
+    <div className="view view-chat">
+      <header className="view-head">
+        <h2>AI 助手</h2>
+        <p>直连本地配置的模型服务（不经 Dify），即问即答。</p>
+      </header>
+
+      <section className="chat-panel">
+        <div className="chat-top">
+          {providers === null ? (
+            <span className="form-hint">读取模型配置中…</span>
+          ) : providers.length === 0 ? (
+            <span className="form-hint">
+              还没有可用模型，
+              <button className="link-btn" onClick={openSettings}>去「设置 → 模型直连」添加 →</button>
+            </span>
+          ) : (
+            <>
+              <select
+                className="input select-inline"
+                value={providerId}
+                onChange={e => selectProvider(e.target.value)}
+              >
+                {providers.map(p => (
+                  <option key={p.id} value={p.id}>{p.name} · {p.model}</option>
+                ))}
+              </select>
+              {selected && <span className="form-hint chat-provider-hint">{selected.base_url}</span>}
+            </>
+          )}
+          <span className="flex-spacer" />
+          {messages.length > 0 && (
+            <button
+              className="btn btn-ghost btn-sm"
+              onClick={() => { setMessages([]); setErr(''); }}
+              title="清空当前对话"
+            >
+              <Eraser size={13} /> 清空
+            </button>
+          )}
+        </div>
+
+        <div className="chat-msgs">
+          {messages.length === 0 && (
+            <div className="chat-empty">
+              <div className="empty-icon"><Bot size={20} /></div>
+              <b>开始对话</b>
+              <p>选好模型后输入问题，例如：「帮我分析这份 JD 的核心要求」。</p>
+            </div>
+          )}
+          {messages.map((m, i) => (
+            <div key={i} className={`bubble ${m.role === 'user' ? 'bubble-user' : 'bubble-assistant'}`}>
+              {m.role === 'user' ? m.content : <Markdown text={m.content} />}
+            </div>
+          ))}
+          {busy && <div className="bubble bubble-assistant"><span className="typing">正在思考…</span></div>}
+          <div ref={bottomRef} />
+        </div>
+
+        {err && <div className="callout callout-err chat-err">{err}</div>}
+
+        <div className="chat-inputbar">
+          <textarea
+            className="input chat-input"
+            rows={2}
+            value={input}
+            placeholder="输入问题，Enter 发送，Shift+Enter 换行"
+            onChange={e => setInput(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                send();
+              }
+            }}
+          />
+          <button className="btn btn-primary" onClick={send} disabled={busy || !input.trim()}>
+            <Send size={15} /> 发送
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}

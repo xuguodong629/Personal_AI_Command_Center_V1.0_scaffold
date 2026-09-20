@@ -1,0 +1,47 @@
+import { useState } from 'react';
+import { Check, Copy, Download } from 'lucide-react';
+import type { ReactNode } from 'react';
+import Markdown from './Markdown';
+import { copyText, downloadText, timestamp } from '../lib/utils';
+
+interface Props {
+  title: string;
+  text: string;
+  badge?: string;
+  /** 结果下方的自定义区（如"下一步"按钮） */
+  footer?: ReactNode;
+}
+
+export default function ResultPanel({ title, text, badge, footer }: Props) {
+  const [copied, setCopied] = useState(false);
+
+  const onCopy = async () => {
+    if (await copyText(text)) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    }
+  };
+
+  return (
+    <section className="result">
+      <header className="result-head">
+        <div className="result-title">
+          {title}
+          {badge && <span className="pill">{badge}</span>}
+        </div>
+        <div className="result-actions">
+          <button className="btn btn-ghost btn-sm" onClick={() => downloadText(`${title}-${timestamp()}.md`, text)}>
+            <Download size={14} /> 下载
+          </button>
+          <button className="btn btn-ghost btn-sm" onClick={onCopy}>
+            {copied ? <Check size={14} /> : <Copy size={14} />} {copied ? '已复制' : '复制'}
+          </button>
+        </div>
+      </header>
+      <div className="result-body">
+        <Markdown text={text} />
+      </div>
+      {footer && <footer className="result-foot">{footer}</footer>}
+    </section>
+  );
+}

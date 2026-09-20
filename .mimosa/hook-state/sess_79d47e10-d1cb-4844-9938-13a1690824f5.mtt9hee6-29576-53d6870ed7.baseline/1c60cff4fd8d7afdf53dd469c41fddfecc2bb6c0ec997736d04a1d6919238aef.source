@@ -1,0 +1,698 @@
+"""模型直连路由：供应商配置（OpenAI 兼容协议）+ 连接测试 + 对话代理
++ 三个业务模块的直连编排（定制简历 / 公司背调 / 岗位雷达）。
+
+配置持久化到项目根 data/config/（实施计划 §七.4 的数据目录约定）：
+- ai.json     模型供应商列表
+- search.json 联网搜索配置（智谱搜索 / Tavily）
+支持任何 OpenAI 兼容服务：智谱 GLM / DeepSeek / Ollama / Kimi / 通义 Qwen / OpenAI。
+"""
+import asyncio
+import json
+import re
+import time
+from pathlib import Path
+from typing import Any, Optional
+
+import httpx
+from fastapi import APIRouter
+from pydantic import BaseModel
+
+router = APIRouter(prefix="/api")
+
+# backend/app/ai.py -> parents[2] = 项目根
+DATA_DIR = Path(__file__).resolve().parents[2] / "data" / "config"
+AI_FILE = DATA_DIR / "ai.json"
+SEARCH_FILE = DATA_DIR / "search.json"
+
+CHAT_TIMEOUT = httpx.Timeout(300.0, connect=15.0)
+TEST_TIMEOUT = httpx.Timeout(60.0, connect=10.0)
+SEARCH_TIMEOUT = httpx.Timeout(25.0, connect=10.0)
+
+
+class Provider(BaseModel):
+    id: str
+    name: str = "自定义模型"
+    base_url: str
+    api_key: str = ""
+    model: str
+
+
+class ProviderList(BaseModel):
+    providers: list[Provider]
+
+
+class TestRequest(BaseModel):
+    base_url: str
+    api_key: str = ""
+    model: str
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatRequest(BaseModel):
+    provider_id: str
+    messages: list[ChatMessage]
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+
+
+class SearchConfig(BaseModel):
+    engine: str = "none"  # none | zhipu | tavily
+    api_key: str = ""
+
+
+class DirectResumeRequest(BaseModel):
+    provider_id: str
+    job_description: str
+    resume_text: str = ""
+
+
+class DirectBgRequest(BaseModel):
+    provider_id: str
+    company_name: str
+    profile: str = ""  # 候选人画像/底线（雇主风险核查透镜）
+
+
+class DirectRadarRequest(BaseModel):
+    provider_id: str
+    position_keywords: str
+    regions: str
+    industries: str
+    resume_summary: str = ""
+    profile: str = ""  # 候选人画像 + 优先级 + 底线 + 评分权重（评分依据）
+
+
+class DirectDeepRequest(BaseModel):
+    provider_id: str
+    mode: str = "invest"  # invest=投资视角 VC 五步 / screen=优秀企业筛选 6 步
+    radar_result: str = ""  # 岗位雷达已生成的机会池文本（分析材料）
+    profile: str = ""       # 候选人画像 / 风险偏好（评分依据）
+
+
+# ---------- 存取 ----------
+
+def _load_providers() -> list[Provider]:
+    if not AI_FILE.exists():
+        return []
+    try:
+        return [Provider(**p) for p in json.loads(AI_FILE.read_text("utf-8"))]
+    except Exception:
+        return []
+
+
+def _save_providers(items: list[Provider]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    AI_FILE.write_text(
+        json.dumps([p.model_dump() for p in items], ensure_ascii=False, indent=2),
+        "utf-8",
+    )
+
+
+def _load_search() -> SearchConfig:
+    if not SEARCH_FILE.exists():
+        return SearchConfig()
+    try:
+        return SearchConfig(**json.loads(SEARCH_FILE.read_text("utf-8")))
+    except Exception:
+        return SearchConfig()
+
+
+def _save_search(cfg: SearchConfig) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    SEARCH_FILE.write_text(cfg.model_dump_json(indent=2), "utf-8")
+
+
+# ---------- 错误翻译 ----------
+
+def _error_message(body: str) -> str:
+    """尽量从 OpenAI 风格错误体中提取 message 字段。"""
+    try:
+        data = json.loads(body)
+        err = data.get("error")
+        if isinstance(err, dict) and err.get("message"):
+            return str(err["message"])
+        if isinstance(data.get("message"), str):
+            return data["message"]
+    except Exception:
+        pass
+    return body[:200]
+
+
+def _translate_status(status: int, body: str) -> str:
+    lower = body.lower()
+    if status == 402 or "insufficient balance" in lower:
+        return "账户余额不足（HTTP 402）。请到对应模型平台充值后重试。"
+    if status in (401, 403):
+        return f"鉴权失败（HTTP {status}）：API Key 无效、被删除或没有该模型权限。{_error_message(body)}"
+    if status == 404:
+        return "接口不存在（HTTP 404）：请检查 base_url 是否完整、模型名是否存在。常见坑：智谱是 https://open.bigmodel.cn/api/paas/v4（不带 /v1），DeepSeek/Ollama 才带 /v1。"
+    if status == 429:
+        return f"请求被限流（HTTP 429）：并发或配额超限，稍后再试。{_error_message(body)}"
+    return f"HTTP {status}：{_error_message(body)}"
+
+
+# ---------- 基础调用 ----------
+
+def _split_list(s: str, limit: int) -> list[str]:
+    return [x for x in re.split(r"[\s,，、;；|]+", s or "") if x][:limit]
+
+
+async def _llm_call(provider: Provider, messages: list[dict], timeout: httpx.Timeout = CHAT_TIMEOUT) -> dict:
+    """调用 OpenAI 兼容 chat/completions，返回 {ok, content?, error?}。"""
+    url = provider.base_url.rstrip("/") + "/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if provider.api_key:
+        headers["Authorization"] = f"Bearer {provider.api_key}"
+    payload = {"model": provider.model, "messages": messages, "stream": False}
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            res = await client.post(url, headers=headers, json=payload)
+    except httpx.HTTPError as e:
+        return {"ok": False, "error": f"模型调用失败（{type(e).__name__}）：{e}"}
+    if res.status_code != 200:
+        return {"ok": False, "error": _translate_status(res.status_code, res.text)}
+    try:
+        content = res.json()["choices"][0]["message"]["content"]
+    except Exception:
+        return {"ok": False, "error": f"响应格式不符合 OpenAI 协议：{res.text[:200]}"}
+    if not content or not content.strip():
+        return {"ok": False, "error": "模型返回了空内容。"}
+    return {"ok": True, "content": content}
+
+
+async def web_search(cfg: SearchConfig, query: str, count: int = 5) -> list[dict]:
+    """联网搜索适配器，返回 [{title, url, content}]；失败返回空列表。"""
+    try:
+        if cfg.engine == "zhipu" and cfg.api_key:
+            async with httpx.AsyncClient(timeout=SEARCH_TIMEOUT) as client:
+                res = await client.post(
+                    "https://open.bigmodel.cn/api/paas/v4/web_search",
+                    headers={
+                        "Authorization": f"Bearer {cfg.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "search_engine": "search_std",
+                        "search_query": query,
+                        "count": count,
+                    },
+                )
+            if res.status_code != 200:
+                return []
+            items = res.json().get("search_result") or []
+            return [
+                {
+                    "title": it.get("title") or "",
+                    "url": it.get("link") or it.get("url") or "",
+                    "content": (it.get("content") or "")[:600],
+                }
+                for it in items[:count]
+            ]
+        if cfg.engine == "tavily" and cfg.api_key:
+            async with httpx.AsyncClient(timeout=SEARCH_TIMEOUT) as client:
+                res = await client.post(
+                    "https://api.tavily.com/search",
+                    json={"api_key": cfg.api_key, "query": query, "max_results": count},
+                )
+            if res.status_code != 200:
+                return []
+            items = res.json().get("results") or []
+            return [
+                {
+                    "title": it.get("title") or "",
+                    "url": it.get("url") or "",
+                    "content": (it.get("content") or "")[:600],
+                }
+                for it in items[:count]
+            ]
+    except httpx.HTTPError:
+        return []
+    return []
+
+
+async def _gather_search(cfg: SearchConfig, queries: list[str]) -> tuple[str, list[str]]:
+    """并行执行多路搜索，返回 (拼好的上下文, 失败提示列表)。"""
+    results = await asyncio.gather(*[web_search(cfg, q) for q in queries])
+    blocks: list[str] = []
+    notes: list[str] = []
+    for i, (q, items) in enumerate(zip(queries, results), 1):
+        if not items:
+            notes.append(q)
+            continue
+        parts = [f"【检索 {i}】{q}"]
+        for j, it in enumerate(items, 1):
+            parts.append(f"[{i}.{j}] {it['title']}｜{it['url']}\n{it['content']}")
+        blocks.append("\n".join(parts))
+    context = "\n\n".join(blocks)
+    if notes:
+        context += f"\n\n（以下检索无结果：{'；'.join(notes)}）"
+    return context, notes
+
+
+# ---------- 供应商管理 ----------
+
+@router.get("/providers")
+def get_providers():
+    return {"ok": True, "providers": [p.model_dump() for p in _load_providers()]}
+
+
+@router.post("/providers")
+def set_providers(body: ProviderList):
+    _save_providers(body.providers)
+    return {"ok": True, "providers": [p.model_dump() for p in body.providers]}
+
+
+@router.post("/providers/test")
+async def test_provider(req: TestRequest):
+    url = req.base_url.rstrip("/") + "/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if req.api_key:
+        headers["Authorization"] = f"Bearer {req.api_key}"
+    payload = {
+        "model": req.model,
+        "messages": [{"role": "user", "content": "请只回复两个字：正常"}],
+        "stream": False,
+    }
+    started = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=TEST_TIMEOUT) as client:
+            res = await client.post(url, headers=headers, json=payload)
+    except httpx.HTTPError as e:
+        return {
+            "ok": False,
+            "error": f"无法连接 {url}（{type(e).__name__}）。请确认服务已启动、地址正确、代理设置无误。",
+        }
+    elapsed = int((time.time() - started) * 1000)
+    body = res.text
+    if res.status_code != 200:
+        return {"ok": False, "error": _translate_status(res.status_code, body)}
+    try:
+        content = res.json()["choices"][0]["message"]["content"]
+    except Exception:
+        return {"ok": False, "error": f"响应格式不符合 OpenAI 协议：{body[:200]}"}
+    return {"ok": True, "reply": (content or "").strip()[:80], "latency_ms": elapsed}
+
+
+@router.post("/ai/chat")
+async def ai_chat(req: ChatRequest):
+    provider = next((p for p in _load_providers() if p.id == req.provider_id), None)
+    if not provider:
+        return {"ok": False, "error": "模型不存在或已被删除，请重新选择。"}
+    r = await _llm_call(provider, [m.model_dump() for m in req.messages])
+    if not r.get("ok"):
+        return r
+    return {"ok": True, "content": r["content"], "model": provider.model}
+
+
+# ---------- 搜索配置 ----------
+
+@router.get("/search")
+def get_search_config():
+    return {"ok": True, "search": _load_search().model_dump()}
+
+
+@router.post("/search")
+def set_search_config(cfg: SearchConfig):
+    _save_search(cfg)
+    return {"ok": True, "search": cfg.model_dump()}
+
+
+# ---------- 直连编排：定制简历（纯 LLM） ----------
+
+RESUME_SYSTEM = (
+    "你是一位资深猎头与简历优化专家，熟悉中国家电、消费品、制造业与 B2B 行业的招聘逻辑。"
+    "所有输出使用中文 Markdown，结构清晰、信息密度高，不要输出与任务无关的客套话。"
+)
+
+def build_resume_user(jd: str, resume: str) -> str:
+    # 注意：JD / 简历内容里可能包含大括号（如 JSON），不能用 str.format 拼接
+    return (
+        "请基于下方【岗位 JD】与【候选人简历】，完成定制简历与匹配分析。\n\n"
+        "【岗位 JD】\n"
+        f"{jd}\n\n"
+        "【候选人简历】\n"
+        f"{resume}\n\n"
+        "请严格按以下结构输出：\n"
+        "# 六维匹配分析\n"
+        "用 Markdown 表格评估六个维度（维度 / 匹配度 高·中·低 / 依据）：行业经验、能力技能、业绩成果、管理与跨度、地域与稳定性、发展意愿匹配。\n"
+        "# 岗位核心要求解读\n"
+        "提炼 5 条以内的关键要求（JD 里真正决定成败的点）。\n"
+        "# 定制简历（一岗一版）\n"
+        "按目标岗位重写候选人简历：突出匹配的经历与量化成果，弱化无关内容，控制在一页纸篇幅；经历描述使用「动作 + 场景 + 量化结果」句式。\n"
+        "# 面试风险与准备建议\n"
+        "指出 3-5 个面试官最可能挑战的点，并给出应对建议。"
+    )
+
+
+@router.post("/ai/direct/resume")
+async def direct_resume(req: DirectResumeRequest):
+    provider = next((p for p in _load_providers() if p.id == req.provider_id), None)
+    if not provider:
+        return {"ok": False, "error": "模型不存在或已被删除，请重新选择。"}
+    user = build_resume_user(
+        jd=req.job_description.strip(),
+        resume=req.resume_text.strip() or "（未提供，请基于 JD 生成通用优化建议并明确指出需要候选人补充的信息）",
+    )
+    r = await _llm_call(provider, [
+        {"role": "system", "content": RESUME_SYSTEM},
+        {"role": "user", "content": user},
+    ])
+    if not r.get("ok"):
+        return r
+    return {"ok": True, "content": r["content"], "model": provider.model}
+
+
+# ---------- 直连编排：公司背调（多路搜索 + 汇总） ----------
+
+BG_SYSTEM = (
+    "你是一位 VC 尽调分析师，擅长撰写结构化、可追溯的公司背调报告。"
+    "所有输出使用中文 Markdown；只依据提供的检索材料写作，材料未覆盖的部分明确写「公开信息未覆盖」，"
+    "不得编造具体数字、日期或事件；报告末尾必须附信息来源清单（引用 [n.m] 编号）。"
+)
+
+BG_SECTIONS = """1. 公司概况；2. 工商注册信息；3. 股权结构与实际控制人；4. 主营业务与产品线；5. 行业地位与竞争格局；
+6. 经营状况与规模；7. 涉诉情况；8. 行政处罚与合规风险；9. 舆情与口碑；10. 财务状况（公开信息）；
+11. 组织与团队；12. 发展战略与近期动态；13. 风险提示；14. 监管问询关注点（若求职视角：雇主风险关注点）；
+15. 综合结论与建议；16. 信息来源清单"""
+
+
+@router.post("/ai/direct/bgcheck")
+async def direct_bgcheck(req: DirectBgRequest):
+    provider = next((p for p in _load_providers() if p.id == req.provider_id), None)
+    if not provider:
+        return {"ok": False, "error": "模型不存在或已被删除，请重新选择。"}
+    company = req.company_name.strip()
+    search_cfg = _load_search()
+
+    context = ""
+    prefix = ""
+    if search_cfg.engine != "none" and search_cfg.api_key:
+        queries = [
+            f"{company} 公司简介 主营业务",
+            f"{company} 工商信息 股东 注册资本",
+            f"{company} 涉诉 裁判文书 法律风险",
+            f"{company} 行政处罚 经营异常",
+            f"{company} 最新新闻 动态",
+            f"{company} 招聘 规模 发展",
+            f"{company} 产品 口碑 评价",
+            f"{company} 行业 地位 竞争对手",
+        ]
+        context, _notes = await _gather_search(search_cfg, queries)
+        if not context.strip():
+            prefix = "> ⚠️ 联网检索全部失败，以下内容基于模型既有知识生成，信息可能过时，请谨慎核对。\n\n"
+    else:
+        prefix = "> ⚠️ 未启用联网搜索（设置 → 模型直连 → 搜索引擎），以下内容基于模型既有知识生成，信息可能过时，请谨慎核对。\n\n"
+
+    profile_txt = req.profile.strip()
+    profile_lens = (
+        f"\n【候选人底线（雇主风险核查透镜）】\n{profile_txt}\n\n"
+        "在第 14 节与「综合结论与建议」中按候选人底线重点核查："
+        "① 渠道费用拖欠 / 回款周期 / 坏账风险信号；② 强压货指标（把区域负责人当压货工具）信号；"
+        "③ 渠道与代理体系完整度（渠道政策 / 结算返利 / 培训体系）以及市场是否「无体系、需从零开荒且无资源支持」；"
+        "④ 待遇真实性（薪资结构 / 提成占比 / 五险一金基数）。"
+        "查到信号逐条列出并标注依据来源；材料未覆盖的写「需在面试/背调中核实」，并给出不冒犯的核实话术。\n"
+        if profile_txt else ""
+    )
+
+    user = f"""请对公司「{company}」撰写 VC 尽调风格的背调报告（16 章节）。
+
+{('以下是实时检索材料，写作时引用 [检索i.j] 编号：' if context else '')}
+{context}
+
+【报告要求】
+- 章节固定为：{BG_SECTIONS}
+- 结论部分区分「就业视角」与「合作/投资视角」两段建议。
+- 每个结论后标注依据来源编号；材料未覆盖的小节写「公开信息未覆盖」。
+{profile_lens}
+{('先说明：' + prefix.strip() + chr(10)) if prefix else ''}"""
+    # 去掉多余空行
+    user = re.sub(r"\n{3,}", "\n\n", user)
+
+    r = await _llm_call(provider, [
+        {"role": "system", "content": BG_SYSTEM},
+        {"role": "user", "content": user},
+    ])
+    if not r.get("ok"):
+        return r
+    content = (prefix + r["content"]) if prefix else r["content"]
+    return {"ok": True, "content": content, "model": provider.model}
+
+
+# ---------- 直连编排：岗位雷达（多路搜索 + 评估分档） ----------
+
+def _platform_links(kw: str, region: str) -> str:
+    """生成各大招聘平台站内搜索的直达链接（官方站点，点开即见实时岗位与 JD）。"""
+    from urllib.parse import quote
+    q = quote(f"{kw} {region}")
+    return (
+        f"[BOSS直聘](https://www.zhipin.com/web/geek/job?query={q}) · "
+        f"[猎聘](https://www.liepin.com/zhaopin/?key={q}) · "
+        f"[智联招聘](https://sou.zhaopin.com/?kw={q}) · "
+        f"[前程无忧](https://we.51job.com/pc/search?keyword={q}) · "
+        f"[领英](https://www.linkedin.com/jobs/search/?keywords={q})"
+    )
+
+RADAR_SYSTEM = (
+    "你是一位经验丰富的招聘顾问，擅长评估岗位质量、企业质量与候选人匹配度。"
+    "评估机会时遵循用户的筛选偏好："
+    "① 企业质量优先级：外企、世界500强、中国500强、地区龙头/优秀企业优先；"
+    "② 福利保障优先级：五险一金最优先，次之五险，未提及或无保障的在材料中如实标注；"
+    "③ 对「同一公司同一或相似岗位在不同平台重复发布、或常年长期挂出」的情况做刷 KPI（虚假/凑数招聘）嫌疑判断。"
+    "所有输出使用中文 Markdown；只依据提供的检索材料整理机会，材料未覆盖的部分明确说明，"
+    "不得编造具体的在招岗位、薪资与联系人信息；每条判断尽量给出依据（引用 [检索i.j] 编号，或明确写「材料未覆盖」）。"
+)
+
+
+@router.post("/ai/direct/radar")
+async def direct_radar(req: DirectRadarRequest):
+    provider = next((p for p in _load_providers() if p.id == req.provider_id), None)
+    if not provider:
+        return {"ok": False, "error": "模型不存在或已被删除，请重新选择。"}
+    kws = _split_list(req.position_keywords, 4)
+    regions = _split_list(req.regions, 4)
+    inds = _split_list(req.industries, 3)
+    if not kws:
+        return {"ok": False, "error": "岗位关键词为空。"}
+
+    kw0 = kws[0]
+    # 平台站内直达检索链接：不依赖搜索引擎召回，保证结果里有能点开的真实岗位入口
+    rg_top = regions[:2]
+    links_block = (
+        "\n【平台站内直达检索（官方站点，点开即见实时岗位与 JD）】\n"
+        + "\n".join(f"- **{rg} · {kw0}**\n  {_platform_links(kw0, rg)}" for rg in rg_top)
+        + "\n"
+        if rg_top
+        else ""
+    )
+
+    search_cfg = _load_search()
+    queries: list[str] = []
+    if search_cfg.engine != "none" and search_cfg.api_key:
+        kw0 = kws[0]
+        # 1) 区域 × 关键词（常规岗位检索）
+        for rg in regions:
+            queries.append(f"{rg} {kw0} {'/'.join(kws[1:3])} 招聘")
+        # 2) 企业质量优先：外企 / 世界500强 / 中国500强 / 本地优秀企业
+        if regions:
+            queries.append(f"{regions[0]} 外企 世界500强 中国500强 {kw0} 招聘")
+        # 3) 主流招聘平台聚合
+        queries.append(f"{kw0} 招聘 BOSS直聘 猎聘 智联招聘 前程无忧")
+        # 4) 职业/社交平台：领英 LinkedIn
+        queries.append(f"linkedin {kw0} {'/'.join(regions[:2])} jobs")
+        # 5) 企业官网直招 + 福利线索
+        if inds:
+            queries.append(f"{kw0} {'/'.join(inds[:2])} 公司 官网 招聘 五险一金")
+        # 去重并截断到 8 路
+        seen: set[str] = set()
+        uniq: list[str] = []
+        for q in queries:
+            if q not in seen:
+                seen.add(q)
+                uniq.append(q)
+        queries = uniq[:8]
+
+    context = ""
+    if queries:
+        context, _notes = await _gather_search(search_cfg, queries)
+
+    profile_txt = req.profile.strip()
+    profile_section = (
+        f"\n【候选人画像与匹配标准（评分依据，务必遵守）】\n{profile_txt}\n\n"
+        if profile_txt else ""
+    )
+    scoring_note = (
+        "\n【评分与分层要求】对每条机会按画像权重逐项打分（0-100）：\n"
+        "- 输出一张总览表：公司/机会 | 加权总分 | 分层(优先投递/谨慎/直接排除) | 命中底线(是/否) | 关键依据\n"
+        "- 分层：≥80 优先投递；60–79 谨慎；<60 直接排除；命中任一条底线直接排除（注明命中哪条）\n"
+        "- 材料覆盖不到的维度如实标低分并注明「待核实：去哪查/问谁」；不要臆造企业实况\n"
+        if profile_txt else ""
+    )
+
+    if not context.strip():
+        disclaimer = "> ⚠️ **未启用联网搜索（或检索无结果）**：本次无实时在招岗位与来源链接。启用方法：设置 → 模型直连 → 搜索引擎（智谱搜索或 Tavily，二选一填 Key）→ 保存 → 重新搜索。以下为基于模型知识的方向性建议（行业、区域、目标企业类型与投递渠道），并附「去哪查到具体岗位」的直达指引。\n\n"
+        user = f"""候选人画像：{req.resume_summary.strip() or '（未提供）'}
+目标岗位关键词：{'、'.join(kws)}
+目标区域：{'、'.join(regions) or '不限'}
+目标行业：{'、'.join(inds) or '不限'}
+
+{profile_section}请输出 Markdown 求职机会分析：
+# 区域与行业机会评估（按 高 / 中 / 低 推荐分档，说明理由）
+# 建议关注的目标公司与渠道（优先外企 / 世界500强 / 中国500强 / 地区优秀企业，给出各类别代表企业与投递渠道：招聘平台、领英、企业官网）
+# 具体岗位检索指引（给出平台官方站点 + 站内检索词，如 BOSS直聘/猎聘/智联/领英/公司官网；不编造在招岗位明细）
+{links_block}
+# 福利保障核查要点（五险一金 → 五险 → 未提及/风险，以及向 HR 核实的话术）
+# 刷 KPI（虚假招聘）排查方法（同公司同岗位多平台常年挂出的识别信号 + 核实动作）
+# 求职策略与下一步动作
+{scoring_note}"""
+    else:
+        disclaimer = ""
+        user = f"""候选人画像：{req.resume_summary.strip() or '（未提供）'}
+目标岗位关键词：{'、'.join(kws)}
+目标区域：{'、'.join(regions) or '不限'}
+目标行业：{'、'.join(inds) or '不限'}
+
+以下是实时检索材料（引用 [检索i.j] 编号）：
+{context}
+{links_block}
+{profile_section}请基于材料输出「今日机会池」，以 Markdown 表格为主体：
+
+## 一、机会池总表（必须放最前面，禁止用大段文字替代）
+| 级 | 机会（岗位 · 公司） | 地区 | 企业类型 | 福利保障 | 来源平台 | 链接 | 一句话依据 |
+其中：
+- 级：高 / 中 / 低 推荐；命中底线或疑似刷 KPI 的写「高⚠️底线」「中⚠️刷量」并在表下说明
+- 企业类型：外企 / 世界500强 / 中国500强 / 地区优秀企业 / 其他 / 待核实（仅按材料）
+- 福利保障：五险一金 / 五险 / 未提及（需核实）
+- 来源平台：按材料写（BOSS直聘 / 猎聘 / 智联 / 前程无忧 / 领英 LinkedIn / 企业官网 / 新闻网站 / 其他）
+- 链接：优先填「来源链接清单」编号 [n]；材料里没有 url 时，改用上方对应地区的平台直达链接（写成可点 Markdown 链接），保证每行都有能点开的链接
+- 一句话依据：匹配要点 + 材料出处 [i.j]；材料中含发布日期/薪资/经验要求的也写进来
+
+## 二、风险与提示
+底线命中 / 疑似刷量逐条说明：判断结论（真实招聘可能性高 / 疑似刷 KPI / 无法判断）+ 依据（重复出现的平台、时间跨度、JD 是否泛化空洞）；材料不足以判断写「材料不足，建议到该公司官网或领英核实」。
+
+## 三、来源链接清单
+与表格一一对应，逐条原样复制（绝不编造、不改写 url）：
+[n] 标题 — url
+表格里没引用的链接也要列出；确实没有链接的条目写「引擎未返回链接」并改用上方平台直达链接。
+
+规则：① 表格第一、清单第二，多余论述从简；② 每条机会尽量有 [n] 可点；③ 若检索材料只有公司/行业级信息、没有具体在招岗位：先明确写「本次检索未覆盖具体岗位」，再按公司给出建议与站内检索指引（平台名 + 检索词 + 官方站点链接）；④ 不要编造材料之外的在招信息。
+{scoring_note}"""
+
+    r = await _llm_call(provider, [
+        {"role": "system", "content": RADAR_SYSTEM},
+        {"role": "user", "content": re.sub(r"\n{3,}", "\n\n", user)},
+    ])
+    if not r.get("ok"):
+        return r
+    return {"ok": True, "content": disclaimer + r["content"], "model": provider.model}
+
+
+# ---------- 直连编排：深度分析（投资视角 VC 五步 / 优秀企业筛选 6 步） ----------
+
+DEEP_SYSTEM = {
+    "invest": (
+        "你是资深猎头 + 企业尽调专家 + 风险投资分析师三位一体。"
+        "前提：求职 = 一笔重仓风险投资——候选人投入的是每天 8 小时+ 的黄金年华，"
+        "公司给的是「现金 + 成长权」，所以用投资人选股逻辑评估雇主。"
+        "只依据下方候选人画像与检索材料分析；公开材料查不到的数据不要编造，"
+        "统一写「待验证」并给出查证路径（去哪查 / 问谁）；不臆造候选人经历。"
+        "全程中文 Markdown，输出像 VC 投委会报告一样结构清晰。"
+    ),
+    "screen": (
+        "你是深耕家电/厨电/耐用消费品行业 15 年以上的资深猎头 + 渠道营销专家 + 企业尽调顾问。"
+        "候选人定位：成熟体系放大器——在成熟严谨体系下可操盘 5000 万级盘子，擅长快速复制放大；"
+        "而非乱局从零硬建（虽有 0→1 经验）。"
+        "只依据下方候选人画像与检索材料分析；查不到的信息写「待核实」并给验证方法；"
+        "不臆造候选人经历与企业实况。全程中文 Markdown，结论具体可执行。"
+    ),
+}
+
+
+def _invest_user(profile: str, material: str) -> str:
+    return f"""候选人画像与风险偏好（务必遵守，勿改动）：
+{profile.strip() or '（未提供）'}
+
+本次岗位雷达检索到的机会池 / 候选材料（据此分析，不要编造材料之外的在招信息）：
+{material.strip()}
+
+请按「风险投资人选股逻辑」执行以下 5 步分析：
+
+# 1 赛道判断（顺势而为 + 时光机）
+按投资价值排序：河南家电/厨电/耐用消费品中「一二线已验证、正在河南/县域加速复制」的细分品类，给出势能依据。
+
+# 2 潜力企业清单（80/20 仓位）
+- 主力 80%（A/B 轮型）：成熟体系 + 扩张期——品牌方 / 一级代理 / 大型经销商集团，含上市公司第二曲线；
+- 机会 20%（天使轮型）：有产业背景创始人、正在规范化的本地潜力品牌。
+每家标注：为什么像潜力股、核心增长信号、主要风险。
+
+# 3 风投式五张尽调卡
+对候选公司输出：① 市场：该品类河南盘子多大、候选人能操盘多少；② 增长验证：近两年营收/门店/代理商数增长（注明数据源或验证路径）；③ 团队：老板/直属上级是否「对的人」（诚信、产业背景、带人记录）及如何查证；④ 单位经济模型：经销商单店盈利、返利/账期健康度；⑤ 现金流：结算及时性、有无拖欠红线。
+
+# 4 逆向否决 + 价值判断
+先用画像中的底线清单做减法（命中即直接排除），再用巴菲特标准回答：这家公司值得候选人用 3–5 年「买入持有」吗？为什么？
+
+# 5 决策输出
+输出「重仓买入（优先投递）/ 观察仓（跟踪）/ 直接卖出（排除）」三层名单；每家给：投递路径（海投/内推/定向私信）+ 需验证的 3 个关键信号 + 查证方法。
+
+材料不足的维度统一标注「待验证」并给查证动作，不要编造数字。"""
+
+
+def _screen_user(profile: str, material: str) -> str:
+    return f"""候选人画像与匹配标准（务必遵守，勿改动）：
+{profile.strip() or '（未提供）'}
+
+本次岗位雷达检索到的候选材料（据此筛选，不要编造材料之外的企业信息）：
+{material.strip()}
+
+请按以下 6 步执行「优秀企业筛选与匹配」：
+
+第 1 步【画像校准】：用 3 句话复述对候选人的理解，点明他是「成熟体系放大器」型操盘手，
+最该匹配「已有相对完整体系、需要有人放大」的企业，最该避开「体系残缺、指望他一人从零硬撑」的坑。
+
+第 2 步【目标企业画像】：定义最适合他的企业长什么样：企业类型（品牌方 / 一级代理 / 大型经销商集团 / 平台型）、
+业务模式（守成维稳 vs 攻坚开荒）、体系成熟度（渠道政策 / 终端管理 / 财务结算 / 培训体系是否已有）。
+
+第 3 步【筛选维度与验证方法】：按 8 个维度给出可执行评估清单，每维给「去哪查、问谁、看什么信号」：
+1 体系成熟度（最关键）；2 渠道基本面（返利/结算是否及时）；3 业绩考核（压库存冲量还是健康动销）；
+4 区域市场现状（空白待开发 vs 维稳提效）；5 发展空间（能否升省区/渠道总监）；
+6 稳定性（管理层/是否频繁换区域负责人）；7 待遇真实性（薪资构成/提成占比/五险一金基数）；
+8 操盘体量匹配（3000 万–1 亿级承接 5000 万能力；<1000 万视为浪费、降分）。
+
+第 4 步【匹配打分模型】：用 0-100 分制按画像权重打分并输出 Markdown 表：
+| 维度 | 权重 | 得分(0-100) | 加权分 | 点评 |
+权重默认：体系成熟度 25% / 发挥成长空间 20% / 稳定性 15% / 渠道健康度 10% / 操盘体量 10% / 薪资待遇 10% / 团队管理层 5% / 工作生活平衡 5%（以画像给出的为准）。
+给出每维高/低分标准；命中画像底线任一条的维度给 0 分并在点评注明。
+
+第 5 步【避坑清单】：给出面试/背调必须查证的红色信号清单（含如何判断「公司体系到底成不成熟」），
+每条配一句不冒犯的反问话术（例如如何委婉问出「上一个区域经理为什么走」）。
+
+第 6 步【决策建议】：按「优先投递 / 谨慎考虑 / 直接排除」分层；
+说明哪类企业最可能把他的「成熟体系放大」能力价值最大化。"""
+
+
+DEEP_TITLES = {
+    "invest": "投资视角 · 潜力企业深挖",
+    "screen": "优秀企业筛选（6 步）",
+}
+
+
+@router.post("/ai/direct/deep")
+async def direct_deep(req: DirectDeepRequest):
+    mode = req.mode
+    if mode not in DEEP_SYSTEM:
+        return {"ok": False, "error": "未知分析模式，请用 invest 或 screen。"}
+    provider = next((p for p in _load_providers() if p.id == req.provider_id), None)
+    if not provider:
+        return {"ok": False, "error": "模型不存在或已被删除，请重新选择。"}
+    if not req.radar_result.strip():
+        return {"ok": False, "error": "请先运行岗位雷达生成机会池，再执行深度分析。"}
+    user = _invest_user(req.profile, req.radar_result) if mode == "invest" else _screen_user(req.profile, req.radar_result)
+    r = await _llm_call(provider, [
+        {"role": "system", "content": DEEP_SYSTEM[mode]},
+        {"role": "user", "content": re.sub(r"\n{3,}", "\n\n", user)},
+    ])
+    if not r.get("ok"):
+        return r
+    return {"ok": True, "content": r["content"], "model": provider.model, "mode": mode, "title": DEEP_TITLES[mode]}

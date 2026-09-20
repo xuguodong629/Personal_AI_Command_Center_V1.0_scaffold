@@ -1,0 +1,53 @@
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from pathlib import Path
+import os
+
+from app.ai import router as ai_router
+
+app = FastAPI(title="Personal AI Command Center API", version="0.2.0")
+
+# 前端开发服务器直连后端；后续 Tauri 壳（tauri://localhost）也走这里
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173", "http://127.0.0.1:5173",
+        "http://localhost:5199", "http://127.0.0.1:5199",
+        "http://localhost:4173", "http://127.0.0.1:4173",
+        "tauri://localhost", "https://tauri.localhost",
+    ],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(ai_router)
+
+class Config(BaseModel):
+    knowledge_base_path: str = ""
+    ai_provider: str = "deepseek"
+    review_required: bool = True
+
+CONFIG = Config(knowledge_base_path=os.getenv("AIOS_KNOWLEDGE_PATH", ""))
+
+@app.get("/api/health")
+def health():
+    return {"status":"online","service":"ai-os-core","version":"0.2.0"}
+
+@app.get("/api/config")
+def get_config():
+    return CONFIG
+
+@app.post("/api/config")
+def set_config(config: Config):
+    global CONFIG
+    CONFIG = config
+    return CONFIG
+
+@app.get("/api/knowledge/stats")
+def knowledge_stats():
+    root = Path(CONFIG.knowledge_base_path) if CONFIG.knowledge_base_path else None
+    if not root or not root.exists():
+        return {"path": str(root) if root else "", "markdown_files": 0, "status":"not_configured"}
+    files = list(root.rglob("*.md"))
+    return {"path":str(root),"markdown_files":len(files),"status":"ready"}

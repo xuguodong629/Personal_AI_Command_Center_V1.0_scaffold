@@ -1,0 +1,162 @@
+import { useEffect, useState } from 'react';
+import { Clock3, Search, ShieldCheck } from 'lucide-react';
+import EnginePicker, { type Engine } from '../components/EnginePicker';
+import ResultPanel from '../components/ResultPanel';
+import { pickOutput, runWorkflow, type DifyConfig } from '../lib/dify';
+import { directBgcheck } from '../lib/backend';
+import { useProviders } from '../lib/useProviders';
+import { useElapsed } from '../lib/useElapsed';
+import { loadLocalDefaults, buildCandidatePrompt } from '../lib/profile';
+
+const RECENT_KEY = 'jc-bg-recent';
+
+function loadRecent(): string[] {
+  try {
+    const raw = localStorage.getItem(RECENT_KEY);
+    if (raw) return JSON.parse(raw) as string[];
+  } catch { /* ignore */ }
+  return [];
+}
+
+interface Props {
+  cfg: DifyConfig;
+  settingsOpen: boolean;
+  openSettings: () => void;
+  pushToast: (kind: 'ok' | 'err' | 'info', msg: string) => void;
+}
+
+export default function BackgroundView({ cfg, settingsOpen, openSettings, pushToast }: Props) {
+  const [company, setCompany] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [result, setResult] = useState('');
+  const [recent, setRecent] = useState<string[]>(loadRecent);
+  const elapsed = useElapsed(busy);
+  const { providers, providerId, select } = useProviders(settingsOpen);
+  // V0.3：默认直连模型（独立运行，不再默认依赖 Dify）；如需 Dify 工作流可在页面顶部手动切换
+  const [engine, setEngine] = useState<Engine>('direct');
+  // 候选人底线画像（local-defaults.json → buildCandidatePrompt），背调按此做雇主风险核查
+  const [profile, setProfile] = useState('');
+
+  useEffect(() => {
+    loadLocalDefaults().then(d => setProfile(buildCandidatePrompt(d)));
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem('jc-engine-bg', engine);
+  }, [engine]);
+
+  useEffect(() => {
+    localStorage.setItem(RECENT_KEY, JSON.stringify(recent));
+  }, [recent]);
+
+  const run = async (name?: string) => {
+    const target = (name ?? company).trim();
+    if (!target) {
+      pushToast('err', '请先输入公司名称');
+      return;
+    }
+    setBusy(true);
+    setErr('');
+    try {
+      if (engine === 'dify') {
+        if (!cfg.bgKey) {
+          openSettings();
+          pushToast('err', '请先填写「公司背调」的 API Key');
+          return;
+        }
+        const r = await runWorkflow(cfg.baseUrl, cfg.bgKey, { company_name: target });
+        if (!r.ok) {
+          setErr(r.error || '运行失败');
+          return;
+        }
+        setResult(pickOutput(r.outputs, ['report', 'text']));
+        pushToast('ok', '背调报告已生成');
+      } else {
+        if (!providerId) {
+          openSettings();
+          pushToast('err', '请先在设置 → 模型直连中添加并选择模型');
+          return;
+        }
+        const r = await directBgcheck(providerId, target, profile);
+        if (!r.ok) {
+          setErr(r.error || '运行失败');
+          return;
+        }
+        setResult(r.content);
+        pushToast('ok', '背调报告已生成（直连模式）');
+      }
+      setRecent(list => [target, ...list.filter(c => c !== target)].slice(0, 6));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const phase = elapsed < 40 ? '8 路并行检索工商与舆情信息…' : elapsed < 90 ? '交叉核对风险与监管记录…' : '撰写 16 章节报告，即将完成…';
+
+  return (
+    <div className="view">
+      <header className="view-head">
+        <h2>公司背调</h2>
+        <p>输入意向公司，生成 VC 尽调 + 监管问询风格的 16 章节背调报告。</p>
+      </header>
+
+      <section className="card">
+        <EnginePicker
+          engine={engine}
+          onEngine={setEngine}
+          providers={providers}
+          providerId={providerId}
+          onProvider={select}
+          openSettings={openSettings}
+          directHint="配置智谱搜索或 Tavily 后可联网检索（设置 → 模型直连）"
+        />
+        <div className="field">
+          <label>公司名称</label>
+          <input
+            className="input input-lg"
+            value={company}
+            onChange={e => setCompany(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter' && !busy) run(); }}
+            placeholder="例如：河南亿格电器销售有限公司，回车开始背调"
+            autoFocus
+          />
+        </div>
+        <div className="form-actions">
+          <button className="btn btn-primary" onClick={() => run()} disabled={busy}>
+            {busy ? <Search size={15} className="spin-once" /> : <ShieldCheck size={15} />}
+            {busy ? `背调中 · 已用 ${elapsed}s` : '开始背调'}
+          </button>
+          <span className="form-hint">8 路搜索 + 分析 · 约 1–2 分钟</span>
+        </div>
+        {err && <div className="callout callout-err">{err}</div>}
+      </section>
+
+      {recent.length > 0 && (
+        <div className="recent">
+          <span className="recent-label"><Clock3 size={13} /> 最近背调</span>
+          {recent.map(c => (
+            <button key={c} className="chip chip-click" onClick={() => !busy && run(c)} disabled={busy}>{c}</button>
+          ))}
+        </div>
+      )}
+
+      {busy && (
+        <section className="progress">
+          <span>{phase}</span>
+          <div className="pbar"><i /></div>
+        </section>
+      )}
+
+      {!busy && result && <ResultPanel title="背调报告" text={result} badge={company.trim()} />}
+
+      {!busy && !result && (
+        <div className="empty">
+          <div className="empty-icon"><ShieldCheck size={20} /></div>
+          <b>还没有背调报告</b>
+          <p>从机会池里挑一家意向公司，输入名称后回车。<br />报告覆盖股权、经营、涉诉、舆情等 16 个章节，可下载留档。</p>
+        </div>
+      )}
+    </div>
+  );
+}

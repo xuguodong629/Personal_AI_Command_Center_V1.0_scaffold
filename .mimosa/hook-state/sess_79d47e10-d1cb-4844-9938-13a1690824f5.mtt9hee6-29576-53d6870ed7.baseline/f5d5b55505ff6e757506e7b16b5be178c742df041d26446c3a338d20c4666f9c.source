@@ -1,0 +1,185 @@
+import { useEffect, useState } from 'react';
+import { Loader2, Plus, Trash2 } from 'lucide-react';
+import {
+  fetchProviders, fetchSearchConfig, saveProviders, saveSearchConfig, testProvider, PRESETS,
+  type ModelProvider, type SearchConfig,
+} from '../lib/backend';
+
+function newId(): string {
+  return `p_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+}
+
+/** 设置弹窗里的「模型直连」标签页：供应商增删改 + 连接测试 */
+export default function ModelsSettings() {
+  const [providers, setProviders] = useState<ModelProvider[]>([]);
+  const [backendErr, setBackendErr] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [dirty, setDirty] = useState(false);
+  const [savedAt, setSavedAt] = useState(0);
+  const [presetIdx, setPresetIdx] = useState(0);
+  const [testingId, setTestingId] = useState<string | null>(null);
+  const [testOut, setTestOut] = useState<Record<string, { ok: boolean; msg: string }>>({});
+  const [search, setSearch] = useState<SearchConfig>({ engine: 'none', api_key: '' });
+
+  useEffect(() => {
+    setLoading(true);
+    Promise.all([fetchProviders(), fetchSearchConfig()]).then(([r, s]) => {
+      if (!r.ok) {
+        setBackendErr(r.error);
+      } else if (r.providers) {
+        setProviders(r.providers);
+        setBackendErr('');
+      } else {
+        setBackendErr('后端返回格式异常');
+      }
+      if (s.ok && s.search) setSearch(s.search);
+      setLoading(false);
+    });
+  }, []);
+
+  const patch = (id: string, p: Partial<ModelProvider>) => {
+    setProviders(list => list.map(x => (x.id === id ? { ...x, ...p } : x)));
+    setDirty(true);
+  };
+
+  const add = () => {
+    const preset = PRESETS[presetIdx];
+    setProviders(list => [
+      ...list,
+      {
+        id: newId(),
+        name: preset.label,
+        base_url: preset.base_url,
+        api_key: '',
+        model: preset.model,
+      },
+    ]);
+    setDirty(true);
+  };
+
+  const remove = (id: string) => {
+    setProviders(list => list.filter(x => x.id !== id));
+    setDirty(true);
+  };
+
+  const save = async () => {
+    const [r, sr] = await Promise.all([saveProviders(providers), saveSearchConfig(search)]);
+    if (!r.ok) {
+      setBackendErr(r.error);
+    } else if (!sr.ok) {
+      setBackendErr(sr.error);
+    } else {
+      setDirty(false);
+      setSavedAt(Date.now());
+      setTimeout(() => setSavedAt(0), 2000);
+    }
+  };
+
+  const test = async (p: ModelProvider) => {
+    if (!p.base_url.trim() || !p.model.trim()) {
+      setTestOut(s => ({ ...s, [p.id]: { ok: false, msg: '请先填写 API 地址与模型名' } }));
+      return;
+    }
+    setTestingId(p.id);
+    const r = await testProvider({ base_url: p.base_url, api_key: p.api_key, model: p.model });
+    setTestingId(null);
+    setTestOut(s => ({
+      ...s,
+      [p.id]: r.ok ? { ok: true, msg: `连通正常（${r.latency_ms}ms）${r.reply ? ` · 模型回复：${r.reply}` : ''}` } : { ok: false, msg: r.error || '测试失败' },
+    }));
+  };
+
+  return (
+    <div className="models-settings">
+      {backendErr && <div className="banner banner-warn">{backendErr}</div>}
+      {loading && <p className="dialog-hint">读取配置中…</p>}
+
+      {!loading && !backendErr && (
+        <>
+          <p className="dialog-hint">
+            直连任何 OpenAI 兼容模型服务，不经 Dify。Key 保存在本机 data/config/ai.json。
+            注意：智谱地址是 <code>https://open.bigmodel.cn/api/paas/v4</code>（不带 /v1）。
+          </p>
+
+          <div className="models-toolbar">
+            <select
+              className="input select-inline"
+              value={presetIdx}
+              onChange={e => setPresetIdx(Number(e.target.value))}
+            >
+              {PRESETS.map((p, i) => (
+                <option key={p.label} value={i}>{p.label}</option>
+              ))}
+            </select>
+            <button className="btn btn-ghost btn-sm" onClick={add}>
+              <Plus size={13} /> 添加模型
+            </button>
+            <span className="flex-spacer" />
+            {savedAt > 0 && <span className="saved-hint">已保存 ✓</span>}
+            <button className="btn btn-primary btn-sm" onClick={save} disabled={!dirty}>
+              {dirty ? '保存配置' : '已保存'}
+            </button>
+          </div>
+
+          {providers.length === 0 && (
+            <p className="dialog-hint">还没有添加模型服务，选择上方预设后点「添加模型」。</p>
+          )}
+
+          {providers.map(p => (
+            <div className="provider-card" key={p.id}>
+              <div className="provider-grid">
+                <label>名称
+                  <input className="input" value={p.name} onChange={e => patch(p.id, { name: e.target.value })} />
+                </label>
+                <label>API 地址（OpenAI 兼容，含到最后一级路径）
+                  <input className="input" value={p.base_url} onChange={e => patch(p.id, { base_url: e.target.value.trim() })} placeholder="https://..." />
+                </label>
+                <label>API Key（本地服务可留空）
+                  <input className="input" type="password" value={p.api_key} onChange={e => patch(p.id, { api_key: e.target.value })} placeholder="sk-..." />
+                </label>
+                <label>模型名
+                  <input className="input" value={p.model} onChange={e => patch(p.id, { model: e.target.value })} placeholder="glm-4.5-air / deepseek-chat / ..." />
+                </label>
+              </div>
+              <div className="provider-actions">
+                <button className="btn btn-ghost btn-sm" onClick={() => test(p)} disabled={testingId !== null}>
+                  {testingId === p.id && <Loader2 size={13} className="spin-once" />}
+                  {testingId === p.id ? '测试中…' : '测试连接'}
+                </button>
+                <button className="btn btn-ghost btn-sm btn-danger" onClick={() => remove(p.id)}>
+                  <Trash2 size={13} /> 删除
+                </button>
+              </div>
+              {testOut[p.id] && (
+                <p className={`test-out ${testOut[p.id].ok ? 'test-ok' : 'test-err'}`}>{testOut[p.id].msg}</p>
+              )}
+            </div>
+          ))}
+
+          <div className="provider-card">
+            <div className="provider-grid">
+              <label>搜索引擎（岗位雷达 / 公司背调 直连模式）
+                <select className="input" value={search.engine} onChange={e => { setSearch({ ...search, engine: e.target.value as SearchConfig['engine'] }); setDirty(true); }}>
+                  <option value="none">不联网（降级模式：输出方向性建议）</option>
+                  <option value="zhipu">智谱网络搜索（可用智谱模型同一个 Key）</option>
+                  <option value="tavily">Tavily（每月 1000 次免费）</option>
+                </select>
+              </label>
+              <label>搜索 API Key
+                <input
+                  className="input"
+                  type="password"
+                  value={search.api_key}
+                  onChange={e => { setSearch({ ...search, api_key: e.target.value }); setDirty(true); }}
+                  placeholder={search.engine === 'zhipu' ? '与智谱模型 Key 相同' : 'tvly-...'}
+                  disabled={search.engine === 'none'}
+                />
+              </label>
+            </div>
+            <p className="dialog-hint">不配搜索时，雷达 / 背调仍可运行，但只能基于模型既有知识输出方向性内容，报告中会明确标注。</p>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}

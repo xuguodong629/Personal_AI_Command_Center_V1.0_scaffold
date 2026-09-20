@@ -1,0 +1,21 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.8
+httpx>=0.27
+
+# 公开页正文抓取（轻量，随启动.bat 自动安装）
+trafilatura>=1.8
+lxml_html_clean>=0.4   # trafilatura 依赖：新版 lxml 已拆分 html.clean
+
+# 免 Key 联网检索（DuckDuckGo）：让雷达/背调在没有任何搜索 API 额度时也能工作
+ddgs>=9.0
+
+# 可选：crawl4ai（JS 渲染抓取，体积大）——用 安装抓取增强.bat 安装，不在此自动装
+# crawl4ai>=0.6
+
+# 可选：语音（模拟面试语音对话）——用 安装语音依赖.bat 安装，不随启动.bat 自动装
+# faster-whisper>=1.0   # 本地语音识别（含 ctranslate2，约 200-400MB）
+# edge-tts>=6.1         # 中文语音合成（免费在线）
+
+# 扩展能力：MCP 服务器接入（Anthropic 官方 SDK）
+mcp>=2.0
