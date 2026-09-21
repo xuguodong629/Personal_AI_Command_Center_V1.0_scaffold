@@ -1,4 +1,4 @@
-﻿"""模型直连路由：供应商配置（OpenAI 兼容协议）+ 连接测试 + 对话代理
+"""模型直连路由：供应商配置（OpenAI 兼容协议）+ 连接测试 + 对话代理
 + 三个业务模块的直连编排（定制简历 / 公司背调 / 岗位雷达）。
 
 配置持久化到项目根 data/config/（实施计划 §七.4 的数据目录约定）：
@@ -1484,6 +1484,78 @@ def _platform_links(kw: str, region: str) -> str:
         f"[领英](https://www.linkedin.com/jobs/search/?keywords={q})"
     )
 
+
+# ---- 岗位详情页定向站点（site: 限定 → 召回直接落在岗位页，而不是公司页/校招页/新闻页）----
+# 排序即优先级：51job 岗位页公开可抓正文（实测抓取成功），BOSS/猎聘/智联多为登录墙（只见标题/公司/地点）。
+JOB_DETAIL_SITES = (
+    "site:jobs.51job.com",        # 前程无忧岗位页：不在登录墙名单，**正文可抓**（JD 全文）
+    "site:zhaopin.com/jobdetail",  # 智联岗位页：不在登录墙名单，可抓
+    "site:zhipin.com/job_detail",  # BOSS 直聘：登录墙，仅摘要（标题/公司/地点/薪资可用）
+    "site:liepin.com/job",         # 猎聘：登录墙，仅摘要
+    "site:51job.com",              # 前程无忧其它入口
+)
+
+# ---- 省 → 省内重点地市（区域只填省名时，必须展开地市，否则召回不到地市岗位）----
+PROVINCE_CITIES: dict[str, tuple[str, ...]] = {
+    "河南": ("郑州", "洛阳", "新乡", "焦作", "许昌", "南阳", "周口", "信阳", "驻马店", "商丘",
+             "平顶山", "安阳", "濮阳", "开封"),
+    "山东": ("济南", "青岛", "烟台", "潍坊", "临沂", "淄博", "济宁"),
+    "江苏": ("南京", "苏州", "无锡", "常州", "南通", "徐州", "扬州"),
+    "浙江": ("杭州", "宁波", "温州", "嘉兴", "绍兴", "金华", "台州"),
+    "广东": ("广州", "深圳", "东莞", "佛山", "中山", "珠海", "惠州"),
+    "湖北": ("武汉", "宜昌", "襄阳", "黄石", "荆州"),
+    "陕西": ("西安", "咸阳", "宝鸡", "渭南"),
+    "四川": ("成都", "绵阳", "德阳", "宜宾", "南充"),
+    "河北": ("石家庄", "唐山", "保定", "廊坊", "邯郸"),
+    "安徽": ("合肥", "芜湖", "蚌埠", "阜阳", "安庆"),
+    "湖南": ("长沙", "株洲", "湘潭", "衡阳", "岳阳"),
+    "福建": ("福州", "厦门", "泉州", "漳州"),
+    "山西": ("太原", "大同", "临汾", "运城"),
+    "江西": ("南昌", "赣州", "九江", "上饶"),
+}
+
+
+def _expand_city_regions(regions_query: list[str], all_regions: list[str], batch: int) -> list[str]:
+    """把「只填了省名」的区域展开出省内重点地市（按批次轮换），并去重。
+
+    没有这一步时，填「河南」只会检索「河南 区域经理 招聘」，地市岗位（洛阳/新乡/焦作…）一条也召回不到。
+    """
+    out: list[str] = []
+    for r in regions_query:
+        r = (r or "").strip()
+        if r and r not in out:
+            out.append(r)
+    for r in all_regions:
+        cities = PROVINCE_CITIES.get((r or "").strip())
+        if not cities:
+            continue
+        rot = batch % len(cities)
+        for c in (cities[rot:] + cities[:rot])[:2]:
+            if c not in out:
+                out.append(c)
+    return out
+
+
+# ---- 目标企业 → 官方招聘域名（公开社招页正文可抓；比泛查询召回公司首页/校招页靠谱得多）----
+CAREER_DOMAINS: dict[str, str] = {
+    "美的": "recruit.midea.com", "海尔": "maker.haier.net", "格力": "gree.com.cn",
+    "海信": "hisense.com", "tcl": "tcl.com", "老板": "robam.com", "方太": "fotile.com",
+    "华帝": "vatti.com.cn", "万和": "vanward.com", "史密斯": "aosmith.com.cn",
+    "九阳": "joyoung.com", "苏泊尔": "supor.com", "施耐德": "se.com",
+    "西门子": "siemens.com", "博西": "bsh-group.com",
+}
+
+
+def _career_site(company: str) -> str:
+    """把企业名映射到官方招聘域名（未收录则返回空，调用方退回「企业名+社会招聘」）。"""
+    c = (company or "").strip().lower()
+    for key, domain in CAREER_DOMAINS.items():
+        if key in c:
+            return domain
+    return ""
+
+
+
 RADAR_SYSTEM = (
     "你是一位经验丰富的招聘顾问，擅长评估岗位质量、企业质量与候选人匹配度。"
     "评估机会时遵循用户的筛选偏好："
@@ -1705,24 +1777,46 @@ async def direct_radar(req: DirectRadarRequest):
     welfare_extra = " ".join(_split_csv(req.welfare_tags)[:3])
     companies = _split_csv(req.target_companies)[:8]
     queries: list[str] = []
+    job_detail_paths: list[str] = []   # P0：岗位详情页 / 官方社招页定向
+    signal_paths: list[str] = []       # P3：四类信号增强
+    extra_paths: list[str] = []        # P4：额度有余才用的补路
     if search_cfg.engine != "none" and search_cfg.api_key:
         ind0 = inds[0] if inds else ""
-        # 1) 区域 × 岗位 × 行业锚点（行业必须进查询，否则召回全是无关行业）
-        for rg in regions_query:
+        rg0 = regions[0] if regions else "河南"
+        # 区域展开：只填省名时补省内重点地市（按批次轮换）——否则「河南 X 招聘」召回不到洛阳/新乡/焦作岗位
+        detail_regions = _expand_city_regions(regions_query, region_all, req.batch or 0)
+
+        # ============ P0 岗位详情页定向（让召回直接落在岗位页，而不是公司页/校招页/新闻页）============
+        sites = list(JOB_DETAIL_SITES)
+        rot = (req.batch or 0) % len(sites)
+        sites = sites[rot:] + sites[:rot]
+        for i, site in enumerate(sites[:3]):
+            rg = detail_regions[i % len(detail_regions)] if detail_regions else rg0
+            job_detail_paths.append(f"{site} {rg} {kw0} {ind0}".strip())
+        # 官方社招页定向：「社会招聘」是正向词（不是负词，不会触发引擎零召回），能显著压低校招页占比；
+        # 有官方招聘域名的企业直接 site: 限定到社招域名（公开可抓，拿到真实 JD），并按批次轮换覆盖全部目标企业
+        comp_rot = (req.batch or 0) % max(len(companies), 1) if companies else 0
+        comp_order = (companies[comp_rot:] + companies[:comp_rot]) if companies else []
+        for c in comp_order[:3]:
+            site = _career_site(c)
+            if site:
+                job_detail_paths.append(f"site:{site} {rg0} {kw0} 招聘".strip())
+            else:
+                job_detail_paths.append(f"{c} 社会招聘 {rg0} {kw0}".strip())
+
+        # ============ P1 核心路：区域/企业/硬条件 ============
+        # 区域 × 岗位 × 行业锚点（行业必须进查询，否则召回全是无关行业）
+        for rg in detail_regions[:3]:
             queries.append(f"{rg} {kw0} {ind0} 招聘".strip())
-        # 2) 目标企业定向核查（候选人重点关注的品牌方）
-        for c in companies[:3]:
-            rg0 = regions[0] if regions else "河南"
+        # 目标企业定向核查（候选人重点关注的品牌方）
+        for c in comp_order[:2]:
             queries.append(f"{c} {rg0} {kw0} 招聘")
-        if companies:
-            queries.append(f"{' '.join(companies[:6])} {kw0} 招聘 官网")
-        # 3) 精准档：公司性质（可多选：世界500强 / 中国500强 / 行业头部 / 外企 / 上市 / 国企 / 民营 / 合资）
+        # 精准档：公司性质（可多选：世界500强 / 中国500强 / 行业头部 / 外企 / 上市 / 国企 / 民营 / 合资）
         tier_keys = [k for k in _split_csv(req.company_tier) if k in TIER_KEYWORDS]
         tier_kw = " ".join(TIER_KEYWORDS[k] for k in tier_keys[:3])
         if tier_kw:
-            rg0 = regions[0] if regions else "河南"
             queries.append(f"{rg0} {tier_kw} {ind0} {kw0} 招聘".strip())
-        # 4) 招聘网站式硬条件（职位类型 / 经验 / 学历 / 规模 / 薪资 / 福利标签）
+        # 招聘网站式硬条件（职位类型 / 经验 / 学历 / 规模 / 薪资）
         hard_bits: list[str] = []
         if req.job_type not in ("", "any"):
             hard_bits.append(req.job_type)
@@ -1736,42 +1830,44 @@ async def direct_radar(req: DirectRadarRequest):
             hard_bits.append(f"{req.salary_min // 1000}-{req.salary_max // 1000}K")
         if hard_bits:
             queries.append(f"{kw0} {ind0} {' '.join(hard_bits)} 招聘".strip())
-        # 5) 福利标签专路
+        # 福利标签专路
         if welfare_extra:
             queries.append(f"{kw0} {ind0} {welfare_extra} 招聘".strip())
-        # 5) 企业质量优先：外企 / 世界500强 / 中国500强（带行业锚点）
-        if regions:
-            queries.append(f"{regions[0]} 外企 世界500强 {ind0} {kw0} 招聘".strip())
-        # 6) 企业官网直招 + 福利线索
-        if inds:
-            queries.append(f"{kw0} {'/'.join(inds[:2])} 公司 官网 招聘 五险一金")
-        # 7) 职业/社交平台：领英 LinkedIn（带行业）
-        queries.append(f"linkedin {kw0} {ind0} {'/'.join(regions[:2])} jobs".strip())
-        # 8) 公司风险联动路（失信/被执行/欠薪/投诉 → 直接标注，不让"看着香"的岗位进推荐位）
+        # 带 JD 正文的页面定向（岗位职责/任职要求 是会出现在正文里的词，命中公司官网/公众号/招聘页）
+        queries.append(f"{detail_regions[0] if detail_regions else rg0} {kw0} {ind0} 岗位职责 任职要求".strip())
+
+        # ============ P3 四类信号增强（风险/扩张/口碑/政策）============
         if req.risk_scan:
-            rg0 = regions[0] if regions else "河南"
-            queries.append(f"{rg0} {ind0} 公司 欠薪 失信 被执行 投诉 劳动仲裁".strip())
-        # 9) 扩张利好路（融资 / 上市 / 扩产 / 技术突破 / 中标 → 判断是否真在扩人）
+            signal_paths.append(f"{rg0} {ind0} 公司 欠薪 失信 被执行 投诉 劳动仲裁".strip())
         if req.growth_scan:
-            queries += growth_queries(companies, regions, inds)
-        # 10) 雇主口碑路（看准 / 脉脉 / 知乎 / 黑猫投诉）
+            signal_paths += growth_queries(companies, regions, inds)
         if req.review_scan:
-            queries += review_queries(companies, regions, inds)
-        # 11) 政策与产业规划路（国家/地方规划、扶持目录、产业链上下游）
+            signal_paths += review_queries(companies, regions, inds)
         if req.policy_scan:
-            queries += policy_queries(regions, inds)
+            signal_paths += policy_queries(regions, inds)
+
+        # ============ P4 企业质量补路（额度有余时用；实测这两路召回多为公司页/聚合页）============
+        if regions:
+            extra_paths.append(f"{regions[0]} 外企 世界500强 {ind0} {kw0} 招聘".strip())
+        if inds:
+            extra_paths.append(f"{kw0} {'/'.join(inds[:2])} 公司 官网 招聘 五险一金")
         # 去重并截断（批次数越大路数越多：换一批时要覆盖新的组合，而不是重复同一批）
+    ordered = job_detail_paths + queries + signal_paths + extra_paths
     seen: set[str] = set()
     uniq: list[str] = []
-    for q in queries:
+    for q in ordered:
         if q and q not in seen:
             seen.add(q)
             uniq.append(q)
     want = max(5, min(60, req.want_count or 20))
     # 每路条数：目标条数越多，单路召回越多（上限 20，受引擎限制）
     per_query = max(3, min(20, req.per_query or (5 if want <= 15 else min(20, max(5, round(want / 3 + 2))))))
-    # 路数上限：基础 14 路，条数需求大时最多扩到 20 路（按 batch 轮换区域/行业组合，避免每次同一批）
-    max_paths = 14 if want <= 20 else (17 if want <= 30 else 20)
+    # 路数上限：基础 16 路；条数需求大或四类信号全开时用满 20 路
+    # （旧版固定 14 路，能把 P0 岗位详情页路和信号路一起截掉——实测 paths=13，尾部政策/口碑路直接没跑）
+    max_paths = 16 if want <= 15 else (18 if want <= 20 else 20)
+    scans_on = sum(1 for x in (req.risk_scan, req.growth_scan, req.review_scan, req.policy_scan) if x)
+    if scans_on >= 3:
+        max_paths = max(max_paths, 20)
     if want > 20 and regions and inds:
         offset = (req.batch or 0) % max(len(regions), 1)
         rotated = regions[offset:] + regions[:offset]
@@ -1789,7 +1885,9 @@ async def direct_radar(req: DirectRadarRequest):
 
     context = ""
     engine_errs: list[str] = []
-    diag: dict[str, Any] = {"engine": search_cfg.engine, "paths": len(queries), "errors": []}
+    diag: dict[str, Any] = {"engine": search_cfg.engine, "paths": len(queries),
+                            "job_detail_paths": [q for q in queries[:6]],
+                            "errors": []}
     manual = (req.manual_material or "").strip()
     if manual:
         # 手工粘贴模式：完全跳过搜索引擎（零额度也能跑），材料同样进词库扫描与规则层

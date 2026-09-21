@@ -18,23 +18,25 @@ OUT = "radar-res-v2-full.json" if FULL else "radar-res-v2.json"
 
 REQ = {
     "provider_id": "p_mu803jvmrcsz",
-    "position_keywords": "区域经理 渠道经理 渠道销售",
-    "regions": "河南 郑州",
-    "industries": "家电 智能家居",
-    "resume_summary": "徐国栋，10 年家电行业渠道与区域销售管理经验，做过省区渠道体系搭建、经销商开发与 KA 客户维护。",
-    "profile": "候选人底线：必须有明确岗位 JD 与可点开的原始招聘链接；不接受公司主页/招聘入口。",
+    # 与前端 local-defaults.json 完全一致的默认口径（徐国栋画像）
+    "position_keywords": "区域经理 渠道经理 渠道销售 区域销售 大客户销售 城市负责人",
+    "regions": "河南 郑州 新乡 洛阳 开封 南阳 信阳 商丘",
+    "industries": "家电 厨电 耐用消费品 净水 消费电子 智能家居",
+    "target_companies": "美的,海尔,格力,海信,TCL,老板电器,方太,华帝,万和,A.O.史密斯,九阳,苏泊尔,施耐德电气,西门子,博西家电",
+    "resume_summary": "徐国栋，33 岁，13 年耐用消费品/家电渠道操盘经验，base 河南新乡。美的（厨电/净水）、海尔（统帅/空调）成熟体系，最大操盘 5000 万级，回款率连续 100%。",
+    "profile": "目标岗位：区域经理/渠道经理/城市负责人；目标地区：河南省内；期望薪资 12000–18000 元/月。底线：必须有明确岗位 JD 与可点开的原始招聘链接；不接受公司主页/招聘入口。",
     "scope": "all",
-    "salary_min": 10000,
-    "salary_max": 20000,
+    "salary_min": 12000,
+    "salary_max": 18000,
     "exp_years": "5-10",
     "job_type": "全职",
-    "publish_days": 7,
-    "want_count": 20,
+    "publish_days": 30,
+    "want_count": 30,
     "batch": 0,
     "risk_scan": True,
     "growth_scan": True,
-    "review_scan": FULL,
-    "policy_scan": FULL,
+    "review_scan": True,
+    "policy_scan": True,
 }
 
 with open(f"{LOGS}\\radar-req{'-full' if FULL else ''}.json", "w", encoding="utf-8") as f:
@@ -55,9 +57,26 @@ if not res.get("ok"):
 pool = res.get("pool") or {}
 items = pool.get("items") or pool.get("rows") or []
 print(f"\npool: rows={pool.get('rows')} batch={pool.get('batch')}")
-print(f"信号: {json.dumps(res.get('signals', {}).get('summary', {}), ensure_ascii=False)[:400]}")
+diag = res.get("diagnostics") or {}
+print(f"检索路数={diag.get('paths')} 引擎={diag.get('engine')}")
+for q in (diag.get("job_detail_paths") or []):
+    print(f"  路: {q}")
+print(f"信号: {json.dumps(res.get('signals', {}).get('summary', {}), ensure_ascii=False)[:420]}")
 ver = res.get("verification") or {}
 print(f"verification: {json.dumps(ver, ensure_ascii=False)[:600]}")
+
+# ---- 材料质量：报告里真正出现的「岗位页 / 官方社招页」域名计数 ----
+content = res.get("content") or ""
+print("\n=== 材料结构（报告正文里出现的域名）===")
+for dom, label in (("jobs.51job.com", "前程无忧岗位页(可抓正文)"), ("51job.com", "前程无忧其他"),
+                   ("zhaopin.com", "智联招聘"), ("zhipin.com", "BOSS直聘(登录墙)"),
+                   ("liepin.com", "猎聘(登录墙)"), ("recruit.midea.com", "美的官方社招"),
+                   ("maker.haier.net", "海尔官方社招"), ("gree.com", "格力官网"),
+                   ("campus", "校招页"), ("yingjiesheng", "应届生求职网"),
+                   ("jobs-worldwide", "LinkedIn聚合页")):
+    n = content.count(dom)
+    if n:
+        print(f"  {label:<26} × {n}")
 
 print("\n--- 具体岗位池 ---")
 for it in items:
