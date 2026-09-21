@@ -20,7 +20,7 @@ from pydantic import BaseModel
 from app.archive import save_report
 from app.channel import all_followups_text, analyze_text as channel_analyze_text, domains_text
 from app.industry import STAGES, evaluate as industry_evaluate, industry_queries, scan_stage
-from app.jobs import JobQueryContext, process_report as process_job_report
+from app.jobs import JobQueryContext, process_report as process_job_report, verify_rows
 from app.risk import RISK_DIMENSIONS, RiskFacts, evaluate as risk_evaluate, risk_queries
 from app.signals import (
     growth_queries,
@@ -175,7 +175,9 @@ def _load_providers() -> list[Provider]:
     if not AI_FILE.exists():
         return []
     try:
-        return [Provider(**p) for p in json.loads(AI_FILE.read_text("utf-8"))]
+        # utf-8-sig：容忍 BOM（用记事本/PowerShell Set-Content 编辑过配置会写入 BOM，
+        # 而 json.loads 遇到 BOM 会直接 JSONDecodeError，曾把搜索引擎配置读崩）
+        return [Provider(**p) for p in json.loads(AI_FILE.read_text("utf-8-sig"))]
     except Exception:
         return []
 
@@ -192,7 +194,7 @@ def _load_search() -> SearchConfig:
     if not SEARCH_FILE.exists():
         return SearchConfig()
     try:
-        return SearchConfig(**json.loads(SEARCH_FILE.read_text("utf-8")))
+        return SearchConfig(**json.loads(SEARCH_FILE.read_text("utf-8-sig")))
     except Exception:
         return SearchConfig()
 
@@ -328,8 +330,30 @@ def _host_of(url: str) -> str:
 
 
 def _is_login_wall(url: str) -> bool:
+    """是否登录墙页面（跳过正文抓取，只保留检索摘要）。
+
+    **按 URL 类型判定，不再按域名一刀切**（实测见 backend/_tmp_probe_fetch2.py）：
+      · BOSS/领英/拉勾/脉脉：岗位页也是 JS 渲染或风控页 → 跳过
+      · 猎聘**岗位详情页**（`/job/<id>.shtml`）是公开服务端渲染页，实测正文 2596 字、JD 关键词 10/10 命中 → 放行抓取
+      · 猎聘列表/搜索页（`/zhaopin/?key=`、`/city-xx/`）无 JD 且量大 → 跳过
+    """
     host = _host_of(url)
-    return any(d in host for d in LOGIN_WALL_DOMAINS)
+    if any(d in host for d in ("zhipin.com", "linkedin.com", "lagou.com", "maimai.cn")):
+        return True
+    if "liepin.com" in host:
+        return not re.search(r"/job/\d+\.shtml|/job/\d+", url)
+    return False
+
+
+def _normalize_job_url(url: str) -> str:
+    """猎聘 www 版岗位页是 JS 渲染（正文抽不出，实测仅 319 字），移动版是公开的服务端渲染同页（2596 字）。
+
+    这里只做**同一岗位的公开 URL 规范化**，不涉及任何登录绕过；规范化也更利于按 URL 去重。
+    """
+    m = re.match(r"^https?://(?:www\.)?liepin\.com(/job/\d+\.shtml)", url or "")
+    if m:
+        return "https://m.liepin.com" + m.group(1)
+    return url or ""
 
 
 def _scope_domains(cfg: SearchConfig, scope: str) -> tuple[str, str]:
@@ -507,7 +531,13 @@ async def _search_engine(
                 return [], "引擎报错：MCP 工具返回内容里没解析到链接（可用 /api/mcp/call 看原始返回）"
         elif engine == "serper":
             # serper.dev：Google 结果，免费 2500 次（一次性），header 带 X-API-KEY
-            payload = {"q": query, "num": min(count, 20), "gl": "cn", "hl": "zh-cn"}
+            # ⚠️ 免费账户对 **运算符查询（site:/inurl:/intitle:/filetype:）的 num 有上限**：
+            #    实测 num>=12 → HTTP 400「Query pattern not allowed for free accounts」，num<=10 正常。
+            #    这曾让「岗位详情页定向路」（site: 限定）整批 400 丢掉，是"河南渠道岗一条都搜不到"的真因。
+            #    因此：运算符查询降到 10，并在 400 时按 5 再降级重试一次（宁可少要几条，也不能丢整路）。
+            has_operator = bool(re.search(r"(?:^|\s)(?:site|inurl|intitle|filetype):", query, re.I))
+            num = min(count, 10 if has_operator else 20)
+            payload = {"q": query, "num": num, "gl": "cn", "hl": "zh-cn"}
             if days == 1:
                 payload["tbs"] = "qdr:d"
             elif days == 7:
@@ -520,6 +550,13 @@ async def _search_engine(
                     headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
                     json=payload,
                 )
+                if res.status_code == 400 and has_operator and num > 5:
+                    payload["num"] = 5
+                    res = await client.post(
+                        "https://google.serper.dev/search",
+                        headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
+                        json=payload,
+                    )
             if res.status_code != 200:
                 return [], f"引擎报错：Serper HTTP {res.status_code}：{_error_message(res.text)}"
             raw = (res.json().get("organic") or [])[:count]
@@ -700,6 +737,209 @@ async def web_search(
     return items
 
 
+# ---- 抓取优先级（按实测可抓性排序，数值越小越先抓）----
+# 证据（backend/_tmp_probe_fetch2.py，2026-09-21 本机网络）：
+#   猎聘移动版岗位页 2596 字含完整 JD ✅ ｜ 猎聘 www 版 319 字 ⚠️ ｜ 智联 Security Verification 0 字 ❌
+#   51job 返回同一拦截页 0 字 ❌ ｜ BOSS JS 渲染 16 字 ❌
+_FETCH_PRIORITY_HOSTS: tuple[tuple[str, int], ...] = (
+    ("m.liepin.com", 0),          # 唯一稳定拿到完整 JD 的岗位页
+    ("recruit.midea.com", 1),     # 官方社招（公开）
+    ("maker.haier.net", 1),
+    ("hotjob.cn", 1),             # 北森 ATS：实测正文可抓（959–3338 字含 JD）
+    ("liepin.com", 2),
+    ("zhaopin.com", 4),           # 反爬拦截，实测 0 字 → 排后
+    ("51job.com", 4),             # 反爬拦截，实测 0 字 → 排后
+)
+
+
+def _fetch_priority(url: str) -> int:
+    """抓取排序权重：优先抓「实测能出正文」的岗位页，别让反爬站点吃掉配额。"""
+    host = _host_of(url)
+    for key, pri in _FETCH_PRIORITY_HOSTS:
+        if key in host:
+            return pri
+    return 3
+
+
+# ---- 岗位详情页 URL 特征（只有这些才算「一条岗位」，聚合页/列表页不算）----
+JOB_DETAIL_URL_PATTERNS = (
+    r"liepin\.com/job/\d+",           # 猎聘岗位页
+    r"zhipin\.com/job_detail/",       # BOSS 岗位页
+    r"zhaopin\.com/(?:jobdetail|jobs)/",  # 智联岗位页
+    r"51job\.com/[^/]+/\d+\.html",    # 前程无忧岗位页
+    r"hotjob\.cn/wt/[^/]+/.*position",  # 北森 ATS 岗位页（实测正文可抓）
+    r"maker\.haier\.net/client/(?:mobile/)?socialdetail/id/",   # 海尔社招岗位详情
+    r"maker\.haier\.net/client/job/detail/id/",
+    r"recruit\.midea\.com/.*jobApplication",                    # 美的岗位申请页
+    r"bsh-group\.com/.*(?:job|career)",                         # 博西岗位页
+)
+_PLATFORM_BY_HOST = (
+    ("m.liepin.com", "猎聘"), ("liepin.com", "猎聘"),
+    ("zhipin.com", "BOSS直聘"), ("zhaopin.com", "智联招聘"),
+    ("51job.com", "前程无忧"), ("maker.haier.net", "海尔官方招聘"),
+    ("recruit.midea.com", "美的官方招聘"), ("bsh-group.com", "博西官方招聘"),
+    ("linkedin.com", "领英"), ("indeed.com", "Indeed 中国"), ("hotjob.cn", "企业招聘门户"),
+)
+_CITY_WORDS = (
+    "郑州", "洛阳", "新乡", "焦作", "许昌", "南阳", "周口", "信阳", "驻马店", "商丘", "平顶山",
+    "安阳", "濮阳", "开封", "漯河", "三门峡", "鹤壁", "济源", "河南", "全国",
+)
+
+
+def _is_job_detail_url(url: str) -> bool:
+    return any(re.search(p, url or "", re.I) for p in JOB_DETAIL_URL_PATTERNS)
+
+
+def _platform_of(url: str) -> str:
+    host = _host_of(url)
+    for key, name in _PLATFORM_BY_HOST:
+        if key in host:
+            return name
+    return host
+
+
+def _clean_title(title: str) -> str:
+    """清洗检索标题里的站点后缀与噪声，尽量还原成「岗位名」。"""
+    t = (title or "").strip()
+    # 站点后缀
+    t = re.sub(r"\s*[-_|｜]\s*(BOSS直聘|猎聘|智联招聘|前程无忧|领英|Indeed.*|58同城|看准网)\s*$", "", t)
+    # 51job/智联 标题形态：「岗位招聘| 城市| 薪资| 公司」或「岗位招聘/ 城市/ 薪资/ 公司」
+    m = re.match(r"^(.{3,}?)\s*招聘\s*[/|｜]", t)
+    if m:
+        t = m.group(1)
+    if "|" in t:
+        t = t.split("|")[0]
+    # 「岗位名招聘_某某有限公司」这类尾巴
+    t = re.sub(r"\s*[_\-–—]\s*[\u4e00-\u9fff\w（）()]{2,30}?(?:有限公司|股份有限公司|集团|公司|商贸|电器|销售公司)\s*$", "", t)
+    t = re.sub(r"[_\-–—]\s*[\u4e00-\u9fff]{2,24}(?:有限公司|股份有限公司|集团|公司)", "", t)
+    t = re.sub(r"^\s*【(.+?)】\s*", r"\1 ", t)          # 猎聘：【郑州 大区经理招聘】-公司…
+    t = re.sub(r"(招聘信息|任职要求|职位描述|岗位职责|招聘|职位)\s*$", "", t)
+    t = t.replace("招聘", "")                 # 标题里的「招聘」是噪声（猎聘【郑州 大区经理招聘】…）
+    # 去掉结尾重复的城市词（猎聘标题会「城市 岗位 城市」重复一次）
+    m = re.search(r"\s*(" + "|".join(_CITY_WORDS) + r")\s*$", t)
+    if m and m.start() >= 3:
+        t = t[:m.start()]
+    return re.sub(r"\s+", " ", t).strip(" -_|｜·/")
+
+
+def _url_key(row_or_url: Any) -> str:
+    """取行/文本里的第一个真实 URL 作为去重键（行里可能带 `｜[1.7]` 这类引用尾巴）。"""
+    s = row_or_url if isinstance(row_or_url, str) else str(row_or_url.get("链接", ""))
+    m = re.search(r"https?://[^\s｜|，；)）]+", s or "")
+    return m.group(0).rstrip("/") if m else ""
+
+
+# 公司名必须带这些后缀（或命中目标品牌），否则视为「解析失败」留空——
+# 实测反面案例：BOSS 标题「新乡市芸岭菌宴餐饮- 经理服务员后厨」曾被解析出公司名「经理服务员后厨」，
+# 于是餐饮岗位绕过了「行业硬门槛」（门槛锚定的是公司字段）回到机会池。
+_COMPANY_SUFFIX = (
+    "公司", "集团", "商贸", "电器", "销售", "实业", "科技", "股份", "厂", "店", "中心", "研究所",
+    "事务所", "分行", "分公司", "商行", "工厂", "制造", "供应链", "连锁", "门店", "家居", "建材",
+)
+_BRAND_HINT = ("海尔", "美的", "格力", "海信", "tcl", "博西", "西门子", "老板电器", "方太", "华帝",
+               "九阳", "苏泊尔", "格兰仕", "奥克斯", "万和", "史密斯", "美菱", "容声", "创维", "长虹")
+
+
+def _plausible_company(name: str) -> bool:
+    n = (name or "").strip()
+    if len(n) < 3:
+        return False
+    low = n.lower()
+    if any(b in low for b in _BRAND_HINT):
+        return True
+    return any(n.endswith(s) or s in n for s in _COMPANY_SUFFIX)
+
+
+def _jd_snippet(text: str) -> str:
+    """从一段文本里切出「JD 片段」（职责/要求类），切不到返回空。"""
+    for pat in (r"(?:职责描述|岗位职责|工作职责|职位描述|岗位要求|任职要求|任职资格|核心工作职责)[：:\s]*(.{30,400}?)(?:\n\s*\n|$)",
+                r"(?:负责[^。\n]{20,200}。)"):
+        m = re.search(pat, text or "", re.S)
+        if m:
+            return re.sub(r"\s+", " ", m.group(0)).strip()[:260]
+    # 退一步：把含「要求/经验/负责」的整句抓出来
+    m = re.search(r"[^\n]{0,40}(?:要求|经验|负责|熟悉)[^\n]{20,200}", text or "")
+    return re.sub(r"\s+", " ", m.group(0)).strip()[:260] if m else ""
+
+
+def _extract_job_candidate(title: str, url: str, text: str, snippet: str) -> dict[str, str]:
+    """从「岗位详情页」的标题 + 正文/摘要里**确定性抽取**一行岗位候选（抽不到就留空，不猜）。
+
+    这是把"材料 → 表格"这段最容易出错的工作从模型手里拿回来：模型只负责把它落进表一，
+    不再需要自己从网页正文里逐列抄。字段为空的含义就是「材料未见」。
+
+    **JD 证据来源：正文与检索摘要都算**（取含 JD 信号且更完整的那份）。为什么必须这样：
+    招聘站的检索摘要本身就带正文片段（实测 `site:jobs.51job.com` 摘要里就有
+    「一、核心工作职责 1.落地执行：承接渠道运营经理策略…」），而 51job/智联的正文常常抓不到
+    （反爬拦截页）。以前只在"抓不到正文"时才退回摘要，于是正文是拦截页噪声时会把噪声当 JD。
+    """
+    blob = f"{title}\n{snippet}\n{text}"
+    header = blob[:600]
+    job = _clean_title(title)
+    company = ""
+    m = re.search(r"[-–—]\s*([^-\n]{2,30}?(?:公司|集团|电器|商贸|科技|实业|股份|服务|销售|制造)[^-\n]{0,12})", title or "")
+    if m:
+        company = m.group(1).strip()
+    if not company:
+        m = re.search(r"([\u4e00-\u9fff]{2,20}(?:有限公司|股份有限公司|集团|商贸|电器公司|销售公司))", header)
+        if m:
+            company = m.group(1)
+    if not _plausible_company(company):
+        company = ""      # 解析不出可信公司名就留空（空 = 材料未见），绝不用错的公司名绕过行业门槛
+    region = next((c for c in _CITY_WORDS if c in header), "")
+    salary = ""
+    m = re.search(r"(\d+(?:\.\d+)?\s*[-~—]\s*\d+(?:\.\d+)?\s*[kK万]|\d+(?:\.\d+)?\s*[kK]|\d+\s*[-~—]\s*\d+\s*[元万])", blob)
+    if m:
+        salary = m.group(1)
+    # JD：正文与摘要各切一次，取更长的那份；并记录证据来源
+    jd_text, jd_snip = _jd_snippet(text or ""), _jd_snippet(snippet or "")
+    if jd_text and (not jd_snip or len(jd_text) >= len(jd_snip)):
+        jd, evidence = jd_text, "已抓正文"
+    elif jd_snip:
+        jd, evidence = jd_snip, "摘要含JD"
+    else:
+        jd, evidence = "", ("已抓正文" if (text or "").strip() else "仅摘要")
+    return {"岗位": job, "公司": company, "地区": region, "薪资": salary,
+            "_来源平台": _platform_of(url), "_链接": url, "_JD要点": jd,
+            "_证据": evidence}
+
+
+def _job_candidates_block(results: list[list[dict]], fetched: dict[str, str]) -> str:
+    """把检索结果里**真正的岗位详情页**整理成确定性候选表，交给模型落位。
+
+    为什么需要它：材料里已经有带完整 JD 的岗位页（实测猎聘移动页 2596 字、海尔社招页含「职责描述」），
+    但让模型从十几份网页正文里逐列抄「岗位/公司/地区/薪资/JD/链接」会大面积填「材料未见」→ 表一恒为 0 条。
+    """
+    seen: set[str] = set()
+    rows: list[dict[str, str]] = []
+    for items in results:
+        for it in items:
+            u = _normalize_job_url((it.get("url") or "").strip())
+            if not u or u in seen or not _is_job_detail_url(u):
+                continue
+            seen.add(u)
+            rows.append(_extract_job_candidate(it.get("title") or "", u,
+                                               fetched.get(u, ""), it.get("content") or ""))
+            if len(rows) >= 40:
+                break
+    if not rows:
+        return ""
+    # 已抓到正文的排前面（可用信息更多）
+    rows.sort(key=lambda r: 0 if r["_证据"] == "已抓正文" else 1)
+    head = ("\n【系统确定性抽取的岗位候选清单（来自岗位详情页，非推测）】\n"
+            "说明：本清单由程序从**岗位详情页**抽取。`_证据=已抓正文` = 已拿到该页正文；"
+            "`_证据=摘要含JD` = 正文抓不到（招聘站反爬），但**检索摘要里带职责/要求原文**，同样可作 JD 证据。"
+            "字段为空 = 该字段材料未见。**表一必须优先从本清单落位**（一行对一行），"
+            "不得添加本清单之外的岗位，也不得把非岗位页（公司页/聚合页/校招页）写进表一。\n")
+    lines = ["| 岗位 | 公司 | 地区 | 薪资 | 来源平台 | 链接 | JD要点 | 证据 |",
+             "|---|---|---|---|---|---|---|---|"]
+    for r in rows:
+        lines.append("| " + " | ".join(
+            (r.get(k) or "材料未见").replace("|", "/") for k in
+            ("岗位", "公司", "地区", "薪资", "_来源平台", "_链接", "_JD要点", "_证据")) + " |")
+    return head + "\n".join(lines) + "\n"
+
+
 async def _fetch_page_text(url: str, fetcher: str = "auto") -> str:
     """抓取公开网页正文（截断 4000 字），带磁盘缓存 / robots 检查 / 一次重试 / 并发限流。
 
@@ -855,13 +1095,15 @@ async def _gather_search(
     final_queries = [f"{q}{suffix}" for q in queries]
     count = max(3, min(20, per_query or cfg.max_results or 5))
 
-    async def run_engine(engine: str, api_key: str, qs: list[str]) -> list[tuple[list[dict], str]]:
+    async def run_engine(engine: str, api_key: str, qs: list[str],
+                         days_override: int | None = None) -> list[tuple[list[dict], str]]:
         extra = {
             "searxng_url": cfg.searxng_url,
             "mcp_server_id": cfg.mcp_server_id,
             "mcp_tool": cfg.mcp_tool,
             "mcp_query_arg": cfg.mcp_query_arg,
         }
+        base_days = cfg.days if days_override is None else days_override
         return await asyncio.gather(
             *[
                 _search_engine(
@@ -871,7 +1113,11 @@ async def _gather_search(
                     count=count,
                     include_domains=include_domains,
                     exclude_domains=exclude_domains,
-                    days=cfg.days,
+                    # **岗位页定向路（site:）不套时间过滤**：招聘岗位详情页没有可靠的「发布时间」元数据，
+                    # 一旦带上 days 过滤就会被引擎整片丢掉 —— 实测（backend/_tmp_probe_days.py）：
+                    # `site:zhaopin.com 郑州 家电 渠道经理` days=0 → 5 条，days=7 → 0 条，days=30 → 0 条。
+                    # 这也是"选了发布时间后河南渠道岗一条都搜不到"的真正原因。
+                    days=(0 if q.strip().startswith("site:") else base_days),
                     extra=extra,
                 )
                 for q in qs
@@ -906,6 +1152,23 @@ async def _gather_search(
             elif err and err not in engine_errors:
                 engine_errors.append(err)
 
+    # **时间过滤回退**：带「发布时间」筛选时仍然为空的查询，去掉时间过滤再试一次
+    # （岗位页/招聘页普遍没有可靠发布时间元数据，days 过滤会把它们整片丢掉；这不是"没岗位"，是"被时间过滤丢了"）
+    no_time_used: list[str] = []
+    if cfg.days:
+        empty_idx2 = [i for i, (items, _e) in enumerate(pairs) if not items]
+        if empty_idx2 and len(empty_idx2) < len(final_queries):
+            qs2 = [final_queries[i] for i in empty_idx2]
+            pairs4 = await run_engine(used_engine,
+                                      cfg.api_key if used_engine == cfg.engine else cfg.fallback_api_key,
+                                      qs2, days_override=0)
+            for pos, (items, err) in zip(empty_idx2, pairs4):
+                if items:
+                    pairs[pos] = (items, "")
+                    no_time_used.append(final_queries[pos])
+                elif err and err not in engine_errors:
+                    engine_errors.append(err)
+
     results = [items for items, _err in pairs]
 
     blocks: list[str] = []
@@ -930,29 +1193,44 @@ async def _gather_search(
     # 因此这里必须按“完整 URL”去重，而不是按 host 去重。
     skipped: list[str] = []
     cache_note = ""
+    fetched: dict[str, str] = {}      # url → 正文（供确定性岗位候选抽取使用）
 
     if cfg.fetch_pages and urls:
         picked: list[str] = []
         seen_urls: set[str] = set()
+        host_counts: dict[str, int] = {}
 
-        fetch_limit = max(0, min(16, cfg.fetch_limit or 4))
+        fetch_limit = max(0, min(24, cfg.fetch_limit or 4))
+        per_host_cap = 8   # 单站点抓取上限：避免一家（如猎聘）把配额吃光，其他来源全被饿死
 
+        # 先收集候选（按完整 URL 去重 + 归一化 + 剔除登录墙），再按「实测可抓性」排序
+        candidates: list[str] = []
+        seen_c: set[str] = set()
         for u in urls:
-            u = (u or "").strip()
-            if not u:
+            u = _normalize_job_url((u or "").strip())
+            if not u or u in seen_c:
                 continue
-
-            # 按完整 URL 去重
-            if u in seen_urls:
-                continue
-
+            seen_c.add(u)
             if cfg.skip_login_walls and _is_login_wall(u):
                 host = _host_of(u)
                 if host:
                     skipped.append(host)
                 continue
+            candidates.append(u)
+        # 稳定排序：同优先级保持检索顺序；猎聘岗位页与官方社招页排最前
+        candidates.sort(key=_fetch_priority)
+
+        for u in candidates:
+            # 按完整 URL 去重
+            if u in seen_urls:
+                continue
+
+            host = _host_of(u)
+            if host_counts.get(host, 0) >= per_host_cap:
+                continue
 
             seen_urls.add(u)
+            host_counts[host] = host_counts.get(host, 0) + 1
             picked.append(u)
 
             if len(picked) >= fetch_limit:
@@ -975,6 +1253,7 @@ async def _gather_search(
             for k, (u, t) in enumerate(zip(picked, texts), 1):
                 if not t or not t.strip():
                     continue
+                fetched[u] = t.strip()
 
                 # 明确绑定：
                 # 网页正文编号 + 原始 URL
@@ -1004,6 +1283,10 @@ async def _gather_search(
             )   
 
     # 只把**真实材料**放进 context（诊断信息绝不混进去）
+    # 先插入「岗位候选清单」：把岗位详情页确定性抽成表，模型只需落位，不必再从网页正文里逐列抄
+    cand_block = _job_candidates_block(results, fetched)
+    if cand_block:
+        blocks.append(cand_block)
     context = "\n\n".join(blocks)
     if context and switched:
         context += f"\n\n{switched}"
@@ -1024,6 +1307,13 @@ async def _gather_search(
         "empty_paths": len(empty_queries),
         "empty_queries": empty_queries[:8],
         "relaxed_used": relaxed_used[:6],
+        "no_time_used": no_time_used[:8],
+        "job_candidates": max(0, cand_block.count("\n|") - 2) if cand_block else 0,
+        "time_filter_note": (
+            f"有 {len(no_time_used)} 路带「发布时间≤{cfg.days} 天」筛选时为 0 条，已自动去掉时间过滤补回："
+            "招聘岗位页没有可靠的发布时间元数据，时间筛选会把岗位页整片丢掉。"
+            if no_time_used else ""
+        ),
         "errors": list(dict.fromkeys(engine_errors))[:6],
         "hint": engine_error_hint(engine_errors) if not context else "",
         "skipped_login_walls": list(dict.fromkeys(skipped))[:8],
@@ -1635,6 +1925,36 @@ def _signals_block(sig: dict[str, Any], has_context: bool, apply: str = "radar")
     return "\n".join(lines) + "\n"
 
 
+def _rows_from_candidate_block(context: str) -> list[dict[str, str]]:
+    """把材料里的「系统确定性抽取的岗位候选清单」表解析回结构化行。
+
+    用途：池子的**确定性兜底**——候选清单是岗位详情页的结构化抽取结果，直接送 jobs.py 判定并入池，
+    不再完全依赖模型把它抄进表一（实测同一批材料下模型抄写质量会波动，池子 18 条 ↔ 7 条）。
+    """
+    if "【系统确定性抽取的岗位候选清单" not in (context or ""):
+        return []
+    block = context.split("【系统确定性抽取的岗位候选清单", 1)[1]
+    header: list[str] | None = None
+    rows: list[dict[str, str]] = []
+    for ln in block.splitlines():
+        if not ln.strip().startswith("|"):
+            if header:
+                break
+            continue
+        cells = [c.strip() for c in ln.strip().strip("|").split("|")]
+        if header is None:
+            header = cells
+            continue
+        if all(set(c) <= set("-: ") for c in cells):
+            continue
+        if len(cells) < len(header):
+            continue
+        rows.append({header[i]: cells[i] for i in range(len(header))})
+        if len(rows) >= 60:
+            break
+    return rows
+
+
 def _extract_pool_rows(content: str) -> list[dict[str, str]]:
     """从机会池报告里解析「表一」的**整行**（含级/岗位/公司/薪资/风险标记/JD 要点等全部列）。
 
@@ -2065,11 +2385,13 @@ async def direct_radar(req: DirectRadarRequest):
 
 ## 表一 · 今日具体岗位（只放真实、具体、可核验的岗位；没有就写"本批 0 条"）
 | 岗位 | 公司 | 地区 | 薪资 | 福利保障 | 经验/学历要求 | 发布时间 | 来源平台 | 链接 | JD要点 | 风险标记 |
+- **优先使用材料里的「系统确定性抽取的岗位候选清单」**：该清单由程序从**岗位详情页**抽取，一行对应一个真实岗位；
+  标 `_证据=已抓正文` 的条目已拿到岗位正文，应当直接落进表一（字段照抄，缺失写「材料未见」）。
 - 必须全部来自材料；字段没有证据一律填「材料未见」，不得自行补充、不得用"JD未覆盖/站内检索"充当 JD
-            "- 【JD证据定义】「JD要点」不要求材料中出现“JD”字样。只要原始检索摘要或「网页正文」中出现岗位职责、岗位要求、任职要求、工作内容、职位描述、负责……、要求……等具体招聘内容，就必须从原文提取 1–3 条核心要点写入「JD要点」；不得因为没有出现“JD”二字而填空。\\n"
-            "- 【招聘列表页限制】如果来源只是公司招聘主页、企业招聘列表页、招聘会汇总页，只有岗位名称而没有该岗位对应的职责、任职要求或职位描述，则不得自行拆分、补全或推断多个岗位；只能放入表二「待核实岗位」。\\n"
-            "- 【来源绑定】岗位、公司、地区、JD要点必须来自同一条招聘证据；不得把A岗位的JD与B岗位、公司主页或其他搜索结果拼接。\\n"
-            "- 【链接绑定】链接必须与该岗位的原始招聘证据对应。禁止根据公司名、岗位名自行生成或改写URL；多个来源合并时，只能引用材料中实际出现的来源编号。\\n"
+- 【JD证据定义】「JD要点」不要求材料中出现"JD"字样。只要原始检索摘要或「网页正文」中出现岗位职责、岗位要求、任职要求、工作内容、职位描述、负责……、要求……等具体招聘内容，就必须从原文提取 1–3 条核心要点写入「JD要点」；不得因为没有出现"JD"二字而填空。
+- 【招聘列表页限制】如果来源只是公司招聘主页、企业招聘列表页、招聘会汇总页，只有岗位名称而没有该岗位对应的职责、任职要求或职位描述，则不得自行拆分、补全或推断多个岗位；只能放入表二「待核实岗位」。
+- 【来源绑定】岗位、公司、地区、JD要点必须来自同一条招聘证据；不得把 A 岗位的 JD 与 B 岗位、公司主页或其他搜索结果拼接。
+- 【链接绑定】链接必须与该岗位的原始招聘证据对应。禁止根据公司名、岗位名自行生成或改写 URL；多个来源合并时，只能引用材料中实际出现的来源编号。
 - 岗位名必须是真实职位名（区域销售经理/渠道经理/大区经理/城市经理/销售经理/KA经理…），不能写"渠道/区域销售岗"这类泛指
 - 链接：材料里的原始招聘链接或来源清单编号（如 [3.2]）；仅公司主页/招聘入口不算岗位链接
 - 若确实 0 条：表一内写一行 `| （本批 0 条具体岗位） | 材料未见 | — | — | — | — | — | — | — | 材料中未出现明确岗位JD | — |`
@@ -2132,6 +2454,38 @@ async def direct_radar(req: DirectRadarRequest):
     watch_rows = verdict["watch"]
     intel_rows = verdict["intel"]
     stats = verdict["stats"]
+
+    # ---- 确定性兜底：把材料里的「岗位候选清单」直接送进同一套规则判定并并入池子 ----
+    # 为什么需要：池子若完全依赖模型把候选清单抄进表一，条数会随模型状态波动
+    # （实测同一批材料：18 条 ↔ 7 条，模型有时把候选行写成「JD 要点缺失」扔进待核实）。
+    # 候选清单本身就是岗位详情页的结构化抽取结果 → 直接判定，池子就与模型状态无关了。
+    det_rows = _rows_from_candidate_block(context)
+    det_merged = 0
+    if det_rows:
+        det = verify_rows(det_rows, ctx, context)
+        have = {(x.get("公司", ""), x.get("岗位", "")) for x in pool_rows}
+        # 去重键用「URL 归一化 + 岗位名」：模型行常带 `｜[1.7]` 引用尾巴，裸串比较会漏掉同一岗位
+        have_url = {k for k in (_url_key(x) for x in pool_rows) if k}
+        for row in det["verified"]:
+            key = (row.get("公司", ""), row.get("岗位", ""))
+            uk = _url_key(row)
+            if key in have or (uk and uk in have_url):
+                continue
+            pool_rows.append(row)
+            have.add(key)
+            if uk:
+                have_url.add(uk)
+            det_merged += 1
+        # 只并入 verified：pending/invalid 不并入，避免与模型的待核实列表重复、并把无关岗位灌进去
+        pool_rows.sort(key=lambda x: int(x.get("_score") or 0), reverse=True)
+        # 同一个岗位不能既在池里又在待核实里（模型两处写法略有差异，用 URL 归一化去重）
+        pool_urls = {k for k in (_url_key(x) for x in pool_rows) if k}
+        if pool_urls:
+            pending_rows = [x for x in pending_rows
+                            if not (_url_key(x) and _url_key(x) in pool_urls)]
+        stats = dict(stats, verified=len(pool_rows), pending=len(pending_rows),
+                     deterministic_merged=det_merged,
+                     deterministic_pending=len(det["pending"]))
     # 公司监控评分挂在所有分类行上（公司层面），岗位评分由 jobs 写入 _score/_layer
     company_scores = _extract_score_map(body)
     for group in (pool_rows, pending_rows):
@@ -2172,6 +2526,7 @@ async def direct_radar(req: DirectRadarRequest):
             "invalid": stats["invalid"],
             "invalid_samples": [f"{x.get('公司', '')}·{x.get('岗位', '')}（{'；'.join((x.get('_job_reasons') or [])[:1])}）"
                                 for x in verdict["invalid"][:6]],
+            "deterministic_merged": stats.get("deterministic_merged", 0),
             "rule": "具体岗位需同时满足：岗位名具体 / 公司明确 / 地区明确且匹配 / 有真实JD / 来源平台可识别 / 有真实链接 / 非推测情报",
         },
     }
@@ -2477,7 +2832,7 @@ def _load_contact_cfg() -> ContactConfig:
     if not CONTACT_FILE.exists():
         return ContactConfig()
     try:
-        return ContactConfig(**json.loads(CONTACT_FILE.read_text("utf-8")))
+        return ContactConfig(**json.loads(CONTACT_FILE.read_text("utf-8-sig")))
     except Exception:
         return ContactConfig()
 

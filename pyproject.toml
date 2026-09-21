@@ -1,0 +1,30 @@
+[project]
+name = "aios-backend"
+version = "1.0.0"
+description = "AIOS（Personal AI Command Center）后端：规范符合性垂直切片"
+requires-python = ">=3.10"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+exclude = ["backend/app", "backend/.venv", "backend/migrations/versions"]
+
+[tool.ruff.lint]
+# 规范 §26：不使用裸 except、不吞异常、类型标注、无硬编码密钥。
+# E501（行长）与既有大模块的风格差异不阻断；其余按规范从严。
+select = ["E", "F", "W", "I", "UP", "B", "S102", "S105", "S106", "SIM"]
+ignore = ["E501", "B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106"]
+"tests/**/*" = ["S105", "S106"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "backend"]
+addopts = "-q"
+markers = [
+    "unit: 领域规则与纯函数（无网络、无真实数据库）",
+    "integration: API + 数据库事务",
+]
+filterwarnings = ["ignore::DeprecationWarning"]

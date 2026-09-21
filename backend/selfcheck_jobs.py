@@ -132,7 +132,7 @@ def main() -> int:
     check("岗位评分含 7 个维度", len(sc["parts"]) == 7, "、".join(p["维度"] for p in sc["parts"]))
 
     print("\n=== V2 新增：公司主页链接 / 行业黑名单 / 刷量降权 / 薪资只看筛选器 ===")
-    from app.jobs import industry_verdict, verify_jobs  # noqa: E402
+    from app.jobs import industry_verdict, verify_jobs, verify_rows  # noqa: E402
 
     rv1 = classify(dict(a, 链接="https://www.midea.com/careers"), CTX, material)
     check("公司主页(careers)链接 → 不得 verified", rv1["status"] == "pending", rv1["reasons"][:2])
@@ -201,9 +201,54 @@ def main() -> int:
     rows = [dict(a, 链接="https://www.zhipin.com/job_detail/v1.html"),
             dict(b, 链接="https://www.zhipin.com/job_detail/v2.html")]
     ver, pen = verify_jobs(rows, CTX, material)
-    check("verify_jobs 兼容包装：返回 (verified, pending) 且写入 _score",
-          len(ver) == 1 and len(pen) == 1 and all("_score" in r for r in ver + pen),
+    check("verify_jobs 兼容包装：invalid 不进 pending（避免把无关岗位灌进待核实）",
+          len(ver) == 1 and len(pen) == 0 and all("_score" in r for r in ver),
           f"verified={len(ver)} pending={len(pen)}")
+    vrows = verify_rows(rows, CTX, material)
+    check("verify_rows 三档分开返回", len(vrows["verified"]) == 1 and len(vrows["invalid"]) == 1,
+          f"verified={len(vrows['verified'])} pending={len(vrows['pending'])} invalid={len(vrows['invalid'])}")
+
+    print("\n=== V2.1：行业硬门槛（偏好④「行业明显不符一律排除」）===")
+    for comp, expect in (("新乡市芸岭菌宴餐饮", "invalid"), ("新乡市牧野区山野野餐饮店", "invalid"),
+                         ("阿斯利康制药有限公司", "invalid"), ("郑州某房地产开发有限公司", "invalid"),
+                         ("XX家电有限公司", "verified")):
+        rr = classify(dict(a, 公司=comp), CTX, material)
+        check(f"雇主「{comp}」→ {expect}", rr["status"] == expect, f"{rr['status']} ｜ {rr['reasons'][:1]}")
+    rr = classify(dict(a, **{"JD 要点": "负责河南区域渠道开发，要求5年以上家电经验；公司提供补充医疗保险与五险一金。"}),
+                  CTX, material)
+    check("JD 提到「补充医疗保险/五险一金」不触发行业排除", rr["status"] == "verified", rr["status"])
+    rr2 = process_report("""## 表二 · 待核实岗位
+| 岗位 | 公司 | 地区 | 来源平台 | 链接 | 缺什么 |
+|---|---|---|---|---|---|
+| 餐饮店长 | 新乡市牧野区山野野餐饮店 | 新乡 | BOSS直聘 | https://www.zhipin.com/job_detail/x.html | 行业不符 |
+""", CTX, material)
+    check("表二里的行业不符岗位不会被捞回待核实", rr2["stats"]["pending"] == 0 and rr2["stats"]["invalid"] == 1,
+          str(rr2["stats"]))
+
+    print("\n=== V2.2：非目标行业不得进「优先投递」（偏好④降为低推荐）===")
+    # 真实形态：字段齐全但与家电/耐消渠道无关（JD 里也不出现目标行业词）
+    cross = {
+        "岗位": "亚马逊产品开发经理", "公司": "郑州环尔先网络科技有限公司", "地区": "郑州二七区",
+        "薪资": "1.5-2.5万·13薪", "经验/学历要求": "3-5年 本科", "来源平台": "智联招聘",
+        "链接": "https://www.zhaopin.com/jobdetail/CCL1443269970J40875536805.htm",
+        "JD 要点": "负责亚马逊平台选品开发与供应商谈判，跟进 listing 优化、站内广告投放与库存周转，要求三年以上跨境电商运营经验。",
+    }
+    for comp, note in (("郑州环尔先网络科技有限公司", "跨境电商（行业未知）"),
+                       ("北新嘉宝莉涂料集团股份有限公司", "涂料（行业未知）"),
+                       ("数据通信科学技术研究所", "通信（行业未知）")):
+        row = dict(cross, 公司=comp)
+        s = score_job(row, CTX, "verified")
+        check(f"「{note}」分层不得为优先投递", s["layer"] != "优先投递" and s["score"] <= 74,
+              f"{s['score']} 分 · {s['layer']}")
+    sj = score_job(dict(a, 公司="珠海双喜电器股份有限公司"), CTX, "verified")
+    check("家电雇主仍可进「优先投递」", sj["layer"] == "优先投递" and sj["score"] > 74,
+          f"{sj['score']} 分 · {sj['layer']}")
+    # 真机实测抓出的问题：海尔官方社招岗位的公司名里只有品牌、没有品类词，曾被误判"非目标行业"而封顶
+    for brand in ("海尔（智家定制生态圈）", "海尔", "广东美的制冷设备有限公司", "格力电器（郑州）",
+                  "博西家用电器（中国）有限公司"):
+        sb = score_job(dict(a, 公司=brand), CTX, "verified")
+        check(f"品牌「{brand}」识别为目标行业（不封顶）", sb["score"] > 74,
+              f"{sb['score']} 分 · {sb['layer']}")
 
     print(f"\n结果：{'全部通过' if ok_all else '存在失败项'}")
     return 0 if ok_all else 1

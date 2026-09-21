@@ -59,17 +59,31 @@ PLACEHOLDER_SUBSTR = (
     "jd未覆盖", "jd 未覆盖", "暂无数据", "缺失", "未返回", "引擎未返回",
 )
 
-# ---- 行业白名单（目标行业）----
+# ---- 目标行业白名单（品类词）----
 GOOD_INDUSTRIES = (
     "家电", "厨电", "中央空调", "暖通", "消费电子", "智能家居", "智能硬件", "小家电",
     "热水器", "净水", "卫浴电器", "照明电器", "空调", "电器", "白电", "黑电", "3c", "家居",
 )
 
+# ---- 目标品牌（家电/厨电/小家电/净水的主力品牌 + 主流外企家电）----
+# 为什么需要它：`GOOD_INDUSTRIES` 只有**品类词**，而岗位标题/公司名里往往只出现**品牌名**
+# （「入职即五险一金区域销售经理 · 海尔」「网格销售 · 海尔」），
+# 只靠品类词会把最对口的雇主误判成"非目标行业"并封顶分层——这是自检之外的真机实测抓出来的。
+TARGET_BRANDS = (
+    "海尔", "卡萨帝", "统帅", "美的集团", "美的制冷", "美的电器", "美的暖通", "美的厨", "美的微清",
+    "格力", "海信", "tcl", "老板电器", "方太", "华帝", "万和", "史密斯", "九阳", "苏泊尔",
+    "格兰仕", "奥克斯", "博西", "西门子家电", "双喜电器", "荣事达", "美菱", "容声", "创维",
+    "康佳", "长虹", "澳柯玛", "樱花卫厨", "帅康", "林内", "能率", "火星人", "亿田", "帅丰",
+    "云米", "小熊电器", "摩飞", "添可", "追觅", "科沃斯", "莱克", "飞科", "爱仕达", "松下电器",
+    "惠而浦", "伊莱克斯", "戴森", "沁园", "安吉尔", "怡口", "艾欧史密斯", "三菱电机", "日立家电",
+)
+
 # ---- 行业黑名单（一票降权，不是硬门槛）----
 BAD_INDUSTRIES = (
-    "食品", "餐饮", "医疗", "医院", "医药", "保险", "证券", "银行", "基金", "金融",
-    "房地产", "地产", "物业", "农业", "种业", "养殖", "化工", "煤矿", "建筑",
-    "法律咨询", "教育培训", "教培", "直播带货", "主播", "mcn", "网贷", "小贷",
+    "食品", "餐饮", "医疗", "医院", "医药", "制药", "药业", "生物医药", "医疗器械", "器械",
+    "保险", "证券", "银行", "基金", "金融", "房地产", "地产", "物业", "农业", "种业", "养殖",
+    "化工", "煤矿", "建筑", "工程咨询", "法律咨询", "教育培训", "教培", "直播带货", "主播",
+    "mcn", "网贷", "小贷", "汽车销售", "汽车服务",
 )
 # 行业判定的假阳性保护：这些语境里的「医疗/银行/保险/物业」不是行业
 INDUSTRY_FALSE_POSITIVE = (
@@ -343,6 +357,9 @@ def industry_verdict(text: str) -> tuple[str, bool]:
     for noise in INDUSTRY_FALSE_POSITIVE + PLACEHOLDER_SUBSTR + tuple(PLACEHOLDER_EXACT):
         if noise and noise in s:
             s = s.replace(noise, " ")
+    for b in TARGET_BRANDS:
+        if b in s:
+            return b, True
     for g in GOOD_INDUSTRIES:
         if g in s:
             return g, True
@@ -385,17 +402,25 @@ def classify(row: dict, ctx: JobQueryContext, material: str = "") -> dict:
     j_ok, j_why = jd_verdict(jd)
     p_ok, p_why = platform_verdict(platform)
     l_ok, l_why = link_verdict(link, material)
+    # 行业硬门槛（画像偏好④「行业明显不符一律排除」）：**只锚定雇主字段**（公司/行业/公司性质），
+    # 不看 JD —— 否则 JD 里出现「食品安全」「补充医疗」会把正常家电岗位误杀。
+    emp_hit, emp_ok = industry_verdict(" ".join([
+        company, _cell(row, "行业"), _cell(row, "公司性质"),
+    ]))
+    ind_ok = not (emp_hit != "未知" and not emp_ok)
 
     gates = {
         "岗位": t_ok, "公司": c_ok, "地区": r_ok, "地区匹配": r_match,
-        "JD要点": j_ok, "来源平台": p_ok, "链接": l_ok,
+        "JD要点": j_ok, "来源平台": p_ok, "链接": l_ok, "行业": ind_ok,
     }
     reasons = [w for w in (t_why, c_why, j_why, p_why, l_why) if w]
     # 地区只在"未通过"时才写进原因；命中的地区是正向信息，不该出现在「缺什么/未进池原因」里
     if r_why and not (r_ok and r_match):
         reasons.append(r_why)
+    if not ind_ok:
+        reasons.append(f"行业明显不符：{emp_hit}（画像偏好④：直接排除）")
 
-    if not t_ok or not c_ok:
+    if not t_ok or not c_ok or not ind_ok:
         status = "invalid"
     elif all(gates.values()):
         status = "verified"
@@ -611,6 +636,15 @@ def score_job(row: dict, ctx: JobQueryContext, status: str,
                       "依据": f"该公司本批出现 {company_batch} 条"})
 
     total = max(0, min(100, score))
+    # 行业封顶（画像偏好④「行业明显不符 → 降为低推荐」）：
+    # 雇主/岗位都不是目标行业（也没命中用户填的目标行业）时，**分层最高只能到「谨慎」**，
+    # 并把总分压到 74 以下——否则「亚马逊产品开发经理」「涂料区域销售」这类会因为字段齐全而抢占优先投递位。
+    target_industry = bool(ctx_hits) or comp_ok or job_ok
+    if not target_industry:
+        total = min(total, 74)
+        reasons.append("非目标行业（家电/耐消渠道），按偏好④降为低推荐")
+        parts.append({"维度": "行业封顶", "得分": 0, "满分": 0,
+                      "依据": f"雇主/岗位行业未命中目标行业（{comp_hit if comp_hit != '未知' else job_hit}）→ 分层上限「谨慎」"})
     layer = "优先投递" if total >= 80 else ("谨慎" if total >= 60 else "直接排除")
     return {"score": total, "layer": layer, "parts": parts, "reasons": reasons}
 
@@ -712,6 +746,8 @@ def _route(row: dict, verdict: dict, from_pending: bool) -> str:
             return "invalid"
         if is_intel_title(_cell(row, "岗位", "职位")):
             return "invalid"
+        if not verdict["gates"].get("行业", True):
+            return "invalid"      # 行业硬门槛不过（餐饮/医疗/地产…）→ 不进待核实，直接排除
         return "pending"
     return "pending"
 
@@ -761,15 +797,15 @@ def process_report(content: str, ctx: JobQueryContext, material: str = "") -> di
             "watch": watch_rows, "intel": intel_rows, "stats": stats}
 
 
-def verify_jobs(rows: list[dict], ctx: JobQueryContext,
-                material: str = "") -> tuple[list[dict], list[dict]]:
-    """兼容包装（旧补丁用过的函数名）：返回 (verified_rows, pending_rows)。
+def verify_rows(rows: list[dict], ctx: JobQueryContext,
+                material: str = "") -> dict[str, list[dict]]:
+    """把一批行按**同一套规则**判定并注解，返回 {verified, pending, invalid}。
 
-    真正的判定只有 `classify()` 一处，避免同一规则两套实现走偏；ai.py 走的是
-    `process_report()`，本函数仅供外部脚本/旧调用方使用。
+    确定性候选清单的兜底路径用它：`invalid` 必须与 `pending` **分开**——
+    否则「餐饮后厨」「货运司机」这类会被当成"待核实岗位"混进列表（实测待核实从 20 涨到 42）。
     """
     counts: dict[str, int] = {}
-    verdicts = []
+    verdicts: list[tuple[dict, dict]] = []
     for row in rows:
         v = classify(row, ctx, material)
         verdicts.append((row, v))
@@ -777,11 +813,21 @@ def verify_jobs(rows: list[dict], ctx: JobQueryContext,
             comp = _cell(row, "公司")
             if comp:
                 counts[comp] = counts.get(comp, 0) + 1
-    verified: list[dict] = []
-    pending: list[dict] = []
+    out: dict[str, list[dict]] = {"verified": [], "pending": [], "invalid": []}
     for row, v in verdicts:
         _annotate(row, v, ctx, counts.get(_cell(row, "公司"), 0))
-        (verified if v["status"] == "verified" else pending).append(row)
-    verified.sort(key=lambda x: int(x.get("_score") or 0), reverse=True)
-    pending.sort(key=lambda x: int(x.get("_score") or 0), reverse=True)
-    return verified, pending
+        out[v["status"]].append(row)
+    for k in out:
+        out[k].sort(key=lambda x: int(x.get("_score") or 0), reverse=True)
+    return out
+
+
+def verify_jobs(rows: list[dict], ctx: JobQueryContext,
+                material: str = "") -> tuple[list[dict], list[dict]]:
+    """兼容包装（旧补丁用过的函数名）：返回 (verified_rows, pending_rows)。
+
+    真正的判定只有 `classify()` 一处，避免同一规则两套实现走偏；ai.py 走的是
+    `process_report()`，本函数仅供外部脚本/旧调用方使用。
+    """
+    r = verify_rows(rows, ctx, material)
+    return r["verified"], r["pending"]

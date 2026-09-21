@@ -41,6 +41,48 @@
 
 ---
 
+## 一之二、AIOS v1 切片（按 `AIOS_Master_Prompt_V1.0.md` 落地）
+
+既有 `/api/*` 与前端界面**保持不变**；规范要求的能力作为新的一层挂在 **`/api/v1`**，代码在 `backend/aios/**`。
+这是「规范第 1–4 步」的可运行垂直切片：数据库与迁移、审计与作业、JIC（职位情报中心）与来源准入、AI 网关与提示词外置。
+
+```powershell
+cd backend
+.\.venv\Scripts\python.exe -m aios.cli migrate        # 建/升级数据库（Alembic；运行时不用 create_all）
+.\.venv\Scripts\python.exe -m aios.cli check          # 配置自检 + 已注册的来源/作业/提示词
+.\.venv\Scripts\python.exe -m aios.cli issue-token    # 生成本地访问令牌（写入 .env 的 AUTH_TOKEN_SHA256）
+.\.venv\Scripts\python.exe -m aios.cli seed-sources   # 写入来源策略样例（默认 disabled，需人工审查后启用）
+.\.venv\Scripts\python.exe -m aios.cli import-radar ..\data\logs\radar-res-v2.json   # 把雷达结果导入 JIC（自动去重）
+.\.venv\Scripts\python.exe -m aios.cli extract ..\data\inbox\sample_jd_material.txt --import-to-jic  # AI 抽取→入库
+```
+
+跑测试与静态检查（规范 §25/§26/§27）：
+
+```powershell
+cd backend
+.\.venv\Scripts\python.exe -m pytest ..\tests -q      # 72 项：领域规则 / Spider / SSRF / API 契约 / 作业 / 审计 / AI 网关
+.\.venv\Scripts\python.exe -m ruff check aios ..\tests
+```
+
+| 能力 | 入口 |
+|---|---|
+| 依赖状态健康检查（含迁移版本、outbox 待发布数） | `GET /api/v1/health` |
+| 职位库：分页 + 过滤白名单 + 可解释匹配 | `GET /api/v1/job-postings`、`GET /api/v1/job-postings/{id}`、`.../matches` |
+| 导入（手工粘贴 / 雷达结果） | `POST /api/v1/job-postings/import` |
+| 个人状态（收藏/已投/归档） | `PATCH /api/v1/job-postings/{id}/state` |
+| 来源注册与策略、健康、受控采集 | `GET/POST /api/v1/job-sources`、`.../health`、`POST /api/v1/job-sources/{id}/runs` |
+| 采集运行进度 | `GET /api/v1/crawl-runs/{id}` |
+| 长任务作业化（立即返回卡片，后台执行） | `POST /api/v1/jobs`、`GET /api/v1/jobs`、`GET /api/v1/jobs/{id}`、`POST /api/v1/jobs/{id}/replay` |
+| 审计事件（不可变） | `GET /api/v1/audit-events` |
+| AI 账本与提示词版本 | `GET /api/v1/ai/runs`、`GET /api/v1/prompts` |
+| 职位提醒规则 | `POST/GET /api/v1/job-alerts` |
+
+**合规边界（规范 §2.2/§14.1/§30.5、附录 B）**：不登录、不存 Cookie、不绕验证码与反爬；未注册或被禁用的来源**不得发出网络请求**；
+遇 401/403/429/风控特征**立即停止该来源并记 `blocked`**；只抓公开页并遵守 robots 与条款。
+**技术栈偏离**（前端框架、默认 SQLite、进程内 worker、目录结构、Python 3.10）已写入 `docs/adr/0001-aios-基线偏离与替换实现.md`。
+
+---
+
 ## 二、功能板块总览
 
 | 板块 | 入口 | 做什么 | 数据存哪 |

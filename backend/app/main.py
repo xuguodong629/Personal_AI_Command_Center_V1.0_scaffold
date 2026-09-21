@@ -56,6 +56,19 @@ app.include_router(interview_router)
 app.include_router(mcp_router)
 app.include_router(skills_router)
 
+# ---------- AIOS v1 切片（规范 §9 /api/v1、§10 鉴权审计、§15 JIC、§19 作业、§22 JSON 日志）----------
+# 既有 /api/* 端点保持不变（向后兼容）；新增能力全部挂在 /api/v1 下。
+try:
+    from aios.api.v1 import install as install_aios
+    from aios.core.logging import configure_logging
+
+    configure_logging()
+    install_aios(app)
+except Exception as exc:  # noqa: BLE001 —— aios 不可用时不能让既有功能整体起不来
+    import logging
+
+    logging.getLogger("aios").warning("AIOS v1 切片未加载：%s", exc)
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 

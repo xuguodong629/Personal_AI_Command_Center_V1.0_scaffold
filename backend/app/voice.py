@@ -57,7 +57,7 @@ def _load_voice_cfg() -> VoiceConfig:
     if not VOICE_FILE.exists():
         return VoiceConfig()
     try:
-        return VoiceConfig(**json.loads(VOICE_FILE.read_text("utf-8")))
+        return VoiceConfig(**json.loads(VOICE_FILE.read_text("utf-8-sig")))
     except Exception:
         return VoiceConfig()
 
