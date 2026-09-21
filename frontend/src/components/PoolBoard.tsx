@@ -5,13 +5,15 @@ import {
 import { openExternal } from '../lib/backend';
 import { downloadText } from '../lib/utils';
 import {
-  cleanCompany, field, isJunk, parseLevel, salaryValue, scoreValue, toCsv,
+  cleanCompany, companyScoreValue, field, isJunk, jobReasons, parseLevel, salaryValue, scoreValue, toCsv,
   type PoolItem,
 } from '../lib/pool';
 
 interface Props {
   items: PoolItem[];
   title?: string;
+  /** jobs=具体岗位（默认，读 _score 岗位评分）；pending=待核实（显示缺什么/怎么核实） */
+  variant?: 'jobs' | 'pending';
   pushToast: (kind: 'ok' | 'err' | 'info', msg: string) => void;
 }
 
@@ -27,7 +29,7 @@ const LEVEL_OPTIONS: Array<{ id: string; label: string; test: (l: string) => boo
 
 /** 机会池面板：卡片（默认）或紧凑表格；带排序/筛选/搜索/导出。
  *  设计目标：把 14 列原始表格变成「一眼能扫、点开能看细节」的列表。 */
-export default function PoolBoard({ items, title = '机会池', pushToast }: Props) {
+export default function PoolBoard({ items, title = '机会池', variant = 'jobs', pushToast }: Props) {
   const [view, setView] = useState<View>('card');
   const [sort, setSort] = useState<SortKey>('level');
   const [levelFilter, setLevelFilter] = useState('all');
@@ -154,8 +156,14 @@ export default function PoolBoard({ items, title = '机会池', pushToast }: Pro
                       <h4>{field(it, '岗位')}</h4>
                       <span className="pool-company">{cleanCompany(it)}</span>
                       {scoreValue(it) >= 0 && (
-                        <span className={`pool-score ${field(it, '_layer').includes('优先') ? 'good' : ''}`}>
-                          {scoreValue(it)} 分{field(it, '_layer') ? ` · ${field(it, '_layer')}` : ''}
+                        <span className={`pool-score ${field(it, '_layer').includes('优先') ? 'good' : ''}`}
+                          title="岗位评分（岗位真实性/地区/岗位/薪资/经验/行业/完整度），与公司监控评分无关">
+                          岗位 {scoreValue(it)} 分{field(it, '_layer') ? ` · ${field(it, '_layer')}` : ''}
+                        </span>
+                      )}
+                      {companyScoreValue(it) >= 0 && (
+                        <span className="pool-chip soft" title="公司监控评分（公司层面加权，仅供背景参考）">
+                          公司监控 {companyScoreValue(it)}
                         </span>
                       )}
                     </div>
@@ -170,6 +178,11 @@ export default function PoolBoard({ items, title = '机会池', pushToast }: Pro
                     {riskMark && !isJunk(riskMark) && (
                       <div className={`pool-risk ${/⚠️|一票否决|刷量|失信|欠薪|收费/.test(riskMark) ? 'severe' : ''}`}>
                         ⚠️ {riskMark}
+                      </div>
+                    )}
+                    {variant === 'pending' && jobReasons(it).length > 0 && (
+                      <div className="pool-risk">
+                        未进具体岗位池：{jobReasons(it).join('；')}
                       </div>
                     )}
                     {jd && !isJunk(jd) && (
@@ -195,6 +208,15 @@ export default function PoolBoard({ items, title = '机会池', pushToast }: Pro
                     <div><i>JD 要点</i>{jd || '材料未见'}</div>
                     <div><i>风险标记</i>{riskMark || '未命中'}</div>
                     <div><i>链接/来源</i>{link || '材料未返回 url，需站内检索'}（{platform || '平台未见'}）</div>
+                    {variant === 'pending' && (
+                      <div><i>缺什么</i>{jobReasons(it).join('；') || '材料未标注'}</div>
+                    )}
+                    {field(it, '下一步怎么核实', '核实') && (
+                      <div><i>核实动作</i>{field(it, '下一步怎么核实', '核实')}</div>
+                    )}
+                    {companyScoreValue(it) >= 0 && (
+                      <div><i>公司监控评分</i>{companyScoreValue(it)} 分{field(it, '_company_layer') ? `（${field(it, '_company_layer')}）` : ''} · 公司层面，非岗位评分</div>
+                    )}
                   </div>
                 )}
               </article>

@@ -6,7 +6,7 @@ import ResultPanel from '../components/ResultPanel';
 import SignalsPanel from '../components/SignalsPanel';
 import PoolBoard from '../components/PoolBoard';
 import { pickOutput, runWorkflow, type DifyConfig } from '../lib/dify';
-import { directRadar, directDeep, type RadarPool, type SearchDiagnostics } from '../lib/backend';
+import { directRadar, directDeep, type RadarPool, type RadarExtras, type SearchDiagnostics } from '../lib/backend';
 import type { Signals } from '../lib/signals';
 import { useProviders } from '../lib/useProviders';
 import { useElapsed } from '../lib/useElapsed';
@@ -145,6 +145,9 @@ export default function RadarView({ cfg, settingsOpen, radarResult, setRadarResu
   const [manual, setManual] = useState(() => localStorage.getItem(MANUAL_KEY) || '');
   /** 机会池结构化条目（表一的行），跨批次累积，供 PoolBoard 渲染 */
   const [poolItems_, setPoolItems] = useState<PoolItem[]>([]);
+  /** 非具体岗位的三类归档（待核实 / 公司监控 / 行业情报）+ 真实性判定统计 */
+  const [extras, setExtras] = useState<RadarExtras | null>(null);
+  const [pendingItems, setPendingItems] = useState<PoolItem[]>([]);
   const cumulative = seenKeys ? seenKeys.split('；').filter(Boolean).length : 0;
 
   useEffect(() => { localStorage.setItem(MANUAL_KEY, manual); }, [manual]);
@@ -257,6 +260,15 @@ export default function RadarView({ cfg, settingsOpen, radarResult, setRadarResu
           setPool(p);
           const newItems = poolItems(p);
           setPoolItems(prev => (refill ? [...prev, ...newItems] : newItems));
+          const ex = r as unknown as RadarExtras;
+          const newPending = (ex.pending_jobs?.items || []) as PoolItem[];
+          setPendingItems(prev => (refill ? [...prev, ...newPending] : newPending));
+          setExtras({
+            pending_jobs: ex.pending_jobs,
+            company_watchlist: ex.company_watchlist,
+            industry_intel: ex.industry_intel,
+            verification: ex.verification,
+          });
           setSeenKeys(prev => {
             const merged = refill ? `${prev}；${p.seen.join('；')}` : p.seen.join('；');
             const items = merged.split('；').filter(Boolean);
@@ -283,6 +295,8 @@ export default function RadarView({ cfg, settingsOpen, radarResult, setRadarResu
     setSeenKeys('');
     setPool(null);
     setPoolItems([]);
+    setPendingItems([]);
+    setExtras(null);
     setSignals(null);
     pushToast('info', '已清空机会池，下一批从第 1 批开始');
   };
@@ -657,8 +671,75 @@ export default function RadarView({ cfg, settingsOpen, radarResult, setRadarResu
       {!busy && signals && <SignalsPanel signals={signals} pushToast={pushToast} />}
 
       {!busy && poolItems_.length > 0 && (
-        <PoolBoard items={poolItems_} title="机会池" pushToast={pushToast} />
+        <PoolBoard items={poolItems_} title="今日具体岗位（通过真实性校验）" pushToast={pushToast} />
       )}
+
+      {!busy && poolItems_.length === 0 && extras?.verification && (
+        <section className="card">
+          <div className="callout callout-warn">
+            <b>本次没有「通过真实性校验」的具体岗位</b>
+            （候选 {extras.verification.candidates} 条 → 通过 {extras.verification.verified} ｜ 待核实 {extras.verification.pending} ｜ 排除 {extras.verification.invalid}）
+            <div className="form-hint" style={{ marginTop: 6 }}>
+              规则：{extras.verification.rule}
+            </div>
+            {extras.verification.invalid_samples?.length ? (
+              <div className="form-hint" style={{ marginTop: 4 }}>
+                被排除的示例：{extras.verification.invalid_samples.join(' ｜ ')}
+              </div>
+            ) : null}
+            <div className="form-hint" style={{ marginTop: 4 }}>
+              这不是检索失败：宁可 0 条，也不用公司情报凑岗位。可在下方「待核实岗位」里找线索。
+            </div>
+          </div>
+        </section>
+      )}
+
+      {!busy && pendingItems.length > 0 && (
+        <PoolBoard items={pendingItems} title="待核实岗位（有招聘迹象，缺关键字段）" variant="pending" pushToast={pushToast} />
+      )}
+
+      {!busy && (extras?.company_watchlist?.rows || extras?.industry_intel?.rows) ? (
+        <section className="card">
+          {extras?.company_watchlist?.rows ? (
+            <>
+              <div className="risk-group-title">目标公司监控（公司值得盯，但没有具体岗位证据）</div>
+              <div className="pool-table-wrap">
+                <table className="pool-table">
+                  <tbody>
+                    {(extras.company_watchlist.items || []).map((w, i) => (
+                      <tr key={`w-${i}`}>
+                        <td className="nowrap-cell">{w['公司'] || '—'}</td>
+                        <td>{w['为什么值得监控'] || w['理由'] || '—'}</td>
+                        <td className="form-hint">{w['依据'] || ''}</td>
+                        <td className="form-hint">{w['监控动作'] || w['建议'] || ''}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          ) : null}
+          {extras?.industry_intel?.rows ? (
+            <>
+              <div className="risk-group-title" style={{ marginTop: 12 }}>行业情报（政策 / 新闻 / 扩产 / 融资）</div>
+              <div className="pool-table-wrap">
+                <table className="pool-table">
+                  <tbody>
+                    {(extras.industry_intel.items || []).map((w, i) => (
+                      <tr key={`i-${i}`}>
+                        <td className="nowrap-cell">{w['主题'] || '—'}</td>
+                        <td>{w['内容'] || '—'}</td>
+                        <td className="form-hint">{w['依据'] || ''}</td>
+                        <td className="form-hint">{w['对我们的意义'] || w['意义'] || ''}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          ) : null}
+        </section>
+      ) : null}
 
       {!busy && radarResult && (
         <ResultPanel

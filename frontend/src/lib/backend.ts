@@ -215,6 +215,24 @@ export interface RadarPool {
   items?: Array<Record<string, string>>;
 }
 
+/** 岗位真实性判定结果：具体岗位需通过 7 项硬门槛 */
+export interface JobVerification {
+  candidates: number;
+  verified: number;
+  pending: number;
+  invalid: number;
+  invalid_samples?: string[];
+  rule?: string;
+}
+
+/** 非具体岗位的三类归档（避免"公司情报被包装成岗位"） */
+export interface RadarExtras {
+  pending_jobs?: { rows: number; items: Array<Record<string, string>>; reasons?: string[] };
+  company_watchlist?: { rows: number; items: Array<Record<string, string>> };
+  industry_intel?: { rows: number; items: Array<Record<string, string>> };
+  verification?: JobVerification;
+}
+
 /** 直连模式：定制简历（纯 LLM） */
 export function directResume(providerId: string, jobDescription: string, resumeText: string): Promise<ApiResult<{ content: string; model: string }>> {
   return call('/api/ai/direct/resume', {
@@ -249,7 +267,7 @@ export function directBgcheck(
 export function directRadar(
   providerId: string,
   inputs: RadarInputs,
-): Promise<ApiResult<{ content: string; model: string; signals?: unknown; pool?: RadarPool }>> {
+): Promise<ApiResult<{ content: string; model: string; signals?: unknown; pool?: RadarPool } & RadarExtras>> {
   return call('/api/ai/direct/radar', {
     method: 'POST',
     body: JSON.stringify({ provider_id: providerId, ...inputs }),

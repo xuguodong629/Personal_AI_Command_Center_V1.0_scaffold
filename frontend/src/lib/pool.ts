@@ -63,6 +63,28 @@ export function scoreValue(it: PoolItem): number {
   return Number.isNaN(n) ? -1 : n;
 }
 
+/** 公司监控评分（_company_score）：来自模型的公司层面加权评分，**不是**岗位评分 */
+export function companyScoreValue(it: PoolItem): number {
+  const cleaned = (it._company_score || '').replace(/[^\d.]/g, '');
+  if (!cleaned) return -1;
+  const n = Number(cleaned);
+  return Number.isNaN(n) ? -1 : n;
+}
+
+/** 岗位真实性状态：verified / pending / invalid / 未知 */
+export function jobStatus(it: PoolItem): 'verified' | 'pending' | 'invalid' | '' {
+  const s = (it._job_status || '').trim();
+  return s === 'verified' || s === 'pending' || s === 'invalid' ? s : '';
+}
+
+/** 未通过硬门槛的原因（决定这条为什么没进具体岗位池） */
+export function jobReasons(it: PoolItem): string[] {
+  const raw = it._job_reasons;
+  if (Array.isArray(raw)) return raw as string[];
+  if (typeof raw === 'string' && raw) return raw.split(/[；;,]/).filter(Boolean);
+  return [];
+}
+
 export function field(it: PoolItem, ...names: string[]): string {
   for (const n of names) {
     const hit = Object.keys(it).find(k => k.includes(n));

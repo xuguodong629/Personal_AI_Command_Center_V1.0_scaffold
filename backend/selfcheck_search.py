@@ -17,7 +17,7 @@ CAPTURED: list[str] = []
 
 
 def make_stub(behavior: str):
-    async def stub(engine, api_key, query, count=5, include_domains="", exclude_domains="", days=0):
+    async def stub(engine, api_key, query, count=5, include_domains="", exclude_domains="", days=0, extra=None):
         CAPTURED.append(query)
         if behavior == "ok":
             return [{"title": f"岗位 {query[:12]}", "url": f"https://example.com/{len(CAPTURED)}",

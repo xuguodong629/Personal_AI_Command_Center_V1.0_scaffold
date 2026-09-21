@@ -347,6 +347,7 @@ cd backend && .venv\Scripts\python.exe selfcheck_fetch.py      # 抓取性能：
 cd backend && .venv\Scripts\python.exe selfcheck_search.py     # 检索层：负词/诊断/放宽重试/缓存（用桩，不耗额度）
 cd backend && .venv\Scripts\python.exe selfcheck_interview.py  # 面试：12 题推进/追问配额/复盘约束（24 项）
 cd backend && .venv\Scripts\python.exe selfcheck_channel.py    # 渠道业务知识库：12 域/套话检测/追问模板（19 项）
+cd backend && .venv\Scripts\python.exe selfcheck_jobs.py       # 岗位真实性判定：硬门槛/三档状态/评分分离（21 项）
 cd backend && .venv\Scripts\python.exe diagnose_search.py      # 直连测引擎：到底是额度、Key 还是网络问题
 cd backend && .venv\Scripts\python.exe probe_deepseek_search.py # 复核 DeepSeek API 是否支持联网搜索（不支持）
 

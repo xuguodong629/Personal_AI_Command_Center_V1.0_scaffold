@@ -1,4 +1,4 @@
-"""模型直连路由：供应商配置（OpenAI 兼容协议）+ 连接测试 + 对话代理
+﻿"""模型直连路由：供应商配置（OpenAI 兼容协议）+ 连接测试 + 对话代理
 + 三个业务模块的直连编排（定制简历 / 公司背调 / 岗位雷达）。
 
 配置持久化到项目根 data/config/（实施计划 §七.4 的数据目录约定）：
@@ -20,6 +20,7 @@ from pydantic import BaseModel
 from app.archive import save_report
 from app.channel import all_followups_text, analyze_text as channel_analyze_text, domains_text
 from app.industry import STAGES, evaluate as industry_evaluate, industry_queries, scan_stage
+from app.jobs import JobQueryContext, process_report as process_job_report
 from app.risk import RISK_DIMENSIONS, RiskFacts, evaluate as risk_evaluate, risk_queries
 from app.signals import (
     growth_queries,
@@ -921,41 +922,86 @@ async def _gather_search(
                 urls.append(it["url"])
         blocks.append("\n".join(parts))
 
-    # 抓取公开页正文：补全检索摘要看不到的 JD / 公告细节
+       # 抓取公开页正文：补全检索摘要看不到的 JD / 公告细节
+    #
+    # 重要：
+    # 招聘雷达不能按 host 去重。
+    # 同一个 BOSS / 猎聘 / LinkedIn 域名下可能同时存在多个不同岗位，
+    # 因此这里必须按“完整 URL”去重，而不是按 host 去重。
     skipped: list[str] = []
     cache_note = ""
+
     if cfg.fetch_pages and urls:
         picked: list[str] = []
-        seen: set[str] = set()
+        seen_urls: set[str] = set()
+
+        fetch_limit = max(0, min(16, cfg.fetch_limit or 4))
+
         for u in urls:
-            host = _host_of(u)
-            if not host or host in seen:
+            u = (u or "").strip()
+            if not u:
                 continue
+
+            # 按完整 URL 去重
+            if u in seen_urls:
+                continue
+
             if cfg.skip_login_walls and _is_login_wall(u):
-                skipped.append(host)
+                host = _host_of(u)
+                if host:
+                    skipped.append(host)
                 continue
-            seen.add(host)
+
+            seen_urls.add(u)
             picked.append(u)
-            if len(picked) >= max(0, min(16, cfg.fetch_limit or 4)):
+
+            if len(picked) >= fetch_limit:
                 break
+
         if picked:
             before = fetch_stats()
-            texts = await asyncio.gather(*[_fetch_page_text(u, cfg.fetcher) for u in picked])
+
+            texts = await asyncio.gather(
+                *[
+                    _fetch_page_text(u, cfg.fetcher)
+                    for u in picked
+                ]
+            )
+
             after = fetch_stats()
+
             web_parts: list[str] = []
+
             for k, (u, t) in enumerate(zip(picked, texts), 1):
-                if t and t.strip():
-                    web_parts.append(f"【网页正文 {k}】{u}\n{t.strip()[:3000]}")
+                if not t or not t.strip():
+                    continue
+
+                # 明确绑定：
+                # 网页正文编号 + 原始 URL
+                # 后续模型可以根据编号追溯来源。
+                web_parts.append(
+                    f"【网页正文 {k}】\n"
+                    f"原始链接：{u}\n"
+                    f"正文：\n"
+                    f"{t.strip()[:5000]}"
+                )
+
             if web_parts:
                 blocks.append("\n\n".join(web_parts))
+
             d_new = after["new"] - before["new"]
             d_cached = after["cached"] - before["cached"]
             d_blocked = after["blocked"] - before["blocked"]
+
             cache_note = (
                 f"正文抓取：新抓 {d_new} 页 / 命中缓存 {d_cached} 页"
-                + (f" / robots 禁止 {d_blocked} 页" if d_blocked else "")
+                + (
+                    f" / robots 禁止 {d_blocked} 页"
+                    if d_blocked
+                    else ""
+                )
                 + f"，候选 {len(picked)} 页"
-            )
+            )   
 
     # 只把**真实材料**放进 context（诊断信息绝不混进去）
     context = "\n\n".join(blocks)
@@ -1450,6 +1496,11 @@ RADAR_SYSTEM = (
     "⑤ 只为有稳定从业经历的社招候选人筛选：校招、应届生、实习生岗位直接排除并注明「校招/届别不符」。"
     "⑥ 联系方式合规红线：只能原样引用检索材料中**已公开招聘**的联系方式（招聘邮箱、公司总机、招聘页公开的联系人称呼）；"
     "**严禁推断、拼接、猜测电话号码，严禁输出任何个人手机号**；公司负责人只输出公开渠道可查的姓名与职务，并给核查路径。"
+    "⑦ **岗位真实性铁律（最高优先级）**：你只能根据检索材料中**明确出现的真实招聘岗位**生成「具体岗位池」。"
+    "严禁根据公司业务、公司规模、融资、扩产、上市、招聘主页、行业新闻、政策、公司官网等信息**推测不存在的岗位**。"
+    "如果材料中没有明确的真实岗位 JD，则该公司**不得生成任何岗位条目**。"
+    "「JD未覆盖」「站内检索」「招聘入口」「区域/渠道销售岗」这类非具体岗位描述**不得进入具体岗位池**。"
+    "**宁可输出 0 条具体岗位，也不得补齐、猜测、推断或创造岗位。**"
     "所有输出使用中文 Markdown；只依据提供的检索材料整理机会，材料未覆盖的部分明确说明，"
     "不得编造具体的在招岗位、薪资与联系人信息；每条判断尽量给出依据（引用 [检索i.j] 编号，或明确写「材料未覆盖」）。"
 )
@@ -1574,8 +1625,14 @@ def _extract_score_map(content: str) -> dict[str, dict[str, str]]:
     return out
 
 
-def _attach_scores(items: list[dict[str, str]], scores: dict[str, dict[str, str]]) -> None:
-    """把表二的加权总分/分层按公司名模糊匹配挂到表一行上（匹配不到就留空，不猜）。"""
+def _attach_company_scores(items: list[dict[str, str]], scores: dict[str, dict[str, str]]) -> None:
+    """把「公司监控评分」按公司名模糊匹配挂到行上（匹配不到就留空，不猜）。
+
+    **分工（本轮改造核心之一）**：
+      · 公司层面加权评分 → `_company_score` / `_company_layer`（公司监控评分）
+      · 岗位层面评分 → 由 `jobs.score_job()` 写入 `_score` / `_layer`（岗位评分，含岗位真实性）
+    两者绝不混用：以前把公司总分写进 `_score`，前端就把公司评分当成了岗位评分。
+    """
     for it in items:
         comp = (it.get("公司") or "").strip()
         post = (it.get("岗位") or "").strip()
@@ -1592,8 +1649,13 @@ def _attach_scores(items: list[dict[str, str]], scores: dict[str, dict[str, str]
                     best = val
                     break
         if best:
-            it["_score"] = best.get("score", "")
-            it["_layer"] = best.get("layer", "")
+            it["_company_score"] = best.get("score", "")
+            it["_company_layer"] = best.get("layer", "")
+
+
+def _attach_scores(items: list[dict[str, str]], scores: dict[str, dict[str, str]]) -> None:
+    """兼容旧调用名（内部转调公司监控评分）。"""
+    _attach_company_scores(items, scores)
 
 
 def _rows_block(rows: list[dict[str, str]], limit: int = 60) -> str:
@@ -1895,36 +1957,58 @@ async def direct_radar(req: DirectRadarRequest):
 以下是实时检索材料（引用 [检索i.j] 编号）：
 {context}
 {links_block}
-{profile_section}{filter_note}{precise_note}{count_note}{signals_block}请基于材料输出「今日机会池」，**全部用表格呈现，禁止大段散文**：
+{profile_section}{filter_note}{precise_note}{count_note}{signals_block}请基于材料输出「今日机会池」，**全部用表格呈现，禁止大段散文**。
 
-## 表一 · 机会池总表（必须放最前面）
-| 级 | 岗位 | 公司 | 地区 | 公司性质 | 公司规模 | 薪资 | 福利保障 | 经验/学历要求 | 发布时间 | 来源平台 | 链接 | 风险标记 | JD 要点 |
-- 级：高 / 中 / 低；命中底线写「高⚠️底线」，疑似刷量写「中⚠️刷量」，行业不符写「低（行业不符）」
-- 风险标记（必填）：命中公司风险关键词就写关键词（如「失信」「欠薪」「被执行」「投诉」）；命中一票否决级风险写「⚠️一票否决：<关键词>」，同时把「级」降为「低⚠️公司风险」
-- 字段材料没有的写「材料未见」；JD 要点取自【网页正文】，标注 [网页k]
-- 链接：优先填表六编号 [n]；材料无 url 时用上方平台直达链接
+**【最重要的铁律｜先读这条】你只能把材料里明确出现的真实招聘岗位写进「表一 · 今日具体岗位」。**
+- 严禁根据公司业务、规模、融资、扩产、上市、招聘主页、行业新闻、政策、官网等信息**推测**岗位；
+- 材料里没有明确岗位 JD 的公司，**一条岗位都不许写**；
+- 「JD未覆盖」「站内检索」「招聘入口」「区域/渠道销售岗」「相关岗位」这类**非具体岗位描述**不得进入表一；
+- **宁可表一 0 条，也不得补齐、猜测、推断、创造岗位**。
 
-## 表二 · 加权评分总览
-| 公司/机会 | 体系成熟度(25) | 发挥成长(20) | 稳定性(15) | 渠道健康(10) | 体量匹配(10) | 薪资(10) | 团队(5) | WLB(5) | 加权总分 | 分层 | 命中底线 | 关键依据 |
+## 表一 · 今日具体岗位（只放真实、具体、可核验的岗位；没有就写"本批 0 条"）
+| 岗位 | 公司 | 地区 | 薪资 | 福利保障 | 经验/学历要求 | 发布时间 | 来源平台 | 链接 | JD要点 | 风险标记 |
+- 必须全部来自材料；字段没有证据一律填「材料未见」，不得自行补充、不得用"JD未覆盖/站内检索"充当 JD
+            "- 【JD证据定义】「JD要点」不要求材料中出现“JD”字样。只要原始检索摘要或「网页正文」中出现岗位职责、岗位要求、任职要求、工作内容、职位描述、负责……、要求……等具体招聘内容，就必须从原文提取 1–3 条核心要点写入「JD要点」；不得因为没有出现“JD”二字而填空。\\n"
+            "- 【招聘列表页限制】如果来源只是公司招聘主页、企业招聘列表页、招聘会汇总页，只有岗位名称而没有该岗位对应的职责、任职要求或职位描述，则不得自行拆分、补全或推断多个岗位；只能放入表二「待核实岗位」。\\n"
+            "- 【来源绑定】岗位、公司、地区、JD要点必须来自同一条招聘证据；不得把A岗位的JD与B岗位、公司主页或其他搜索结果拼接。\\n"
+            "- 【链接绑定】链接必须与该岗位的原始招聘证据对应。禁止根据公司名、岗位名自行生成或改写URL；多个来源合并时，只能引用材料中实际出现的来源编号。\\n"
+- 岗位名必须是真实职位名（区域销售经理/渠道经理/大区经理/城市经理/销售经理/KA经理…），不能写"渠道/区域销售岗"这类泛指
+- 链接：材料里的原始招聘链接或来源清单编号（如 [3.2]）；仅公司主页/招聘入口不算岗位链接
+- 若确实 0 条：表一内写一行 `| （本批 0 条具体岗位） | 材料未见 | — | — | — | — | — | — | — | 材料中未出现明确岗位JD | — |`
+
+## 表二 · 待核实岗位（有招聘迹象，但缺关键字段：缺地点/缺JD/链接无法确认/地区不符）
+| 岗位 | 公司 | 地区 | 薪资 | 来源平台 | 链接 | 缺什么 | 下一步怎么核实 |
+- 这里放"看着像在招但证据不全"的：只有招聘入口、只有岗位名没 JD、地点不明、或地点与该用户目标区域不符的
+- 「缺什么」「下一步怎么核实」必须具体（如：缺工作地点 → 电话/邮件问 HR 驻区）
+
+## 表三 · 目标公司监控（公司值得持续盯，但**没有**具体岗位证据）
+| 公司 | 为什么值得监控（业务/扩张/融资/上市/资质/口碑） | 依据 | 监控动作 |
+- 公司级情报放这里，**不得**在表一为它生成岗位
+
+## 表四 · 行业情报（政策/行业新闻/扩产/融资等，与具体岗位无关）
+| 主题 | 内容 | 依据 | 对我们的意义 |
+
+## 表五 · 公司监控评分（注意：这是**公司层面**评分，不是岗位评分）
+| 公司 | 体系成熟度(25) | 发挥成长(20) | 稳定性(15) | 渠道健康(10) | 体量匹配(10) | 薪资(10) | 团队(5) | WLB(5) | 加权总分 | 分层 | 命中底线 | 关键依据 |
 分层：≥80 优先投递；60–79 谨慎；<60 直接排除；命中任一底线直接排除。材料覆盖不到的维度给低分并注明「待核实：去哪查/问谁」。
 命中公司风险关键词（尤其一票否决级）的机会，分层最高只能到「谨慎」，并在关键依据里写明命中的关键词。
 
-## 表三 · 逐条深度解析（高/中推荐每条都要有）
+## 表六 · 逐条深度解析（仅针对表一的具体岗位，表一为 0 条时本节写「无具体岗位，不展开」）
 | 公司/机会 | 业务与行业地位 | 对你的价值（能否放大 5000 万级） | 风险点（体系/回款/压货/空壳/失信/欠薪） | 面试必问 3 题 | 谈薪要点 | 公开联系方式 |
 
-## 表四 · 风险 · 刷量 · 口碑 综合判定
+## 表七 · 风险 · 刷量 · 口碑 综合判定
 | 公司/机会 | 公司风险（命中关键词 + 结论：真实招聘可能性高 / 需核实 / 高风险） | 刷量/虚假招聘（多平台重复、长期挂出、批量发布、猎头代招） | 雇主口碑（看准/脉脉/知乎/投诉平台的评价与高频负面主题） | 依据（关键词、重复次数、时间跨度、JD 是否空洞） | 建议核实动作 |
 
-## 表五 · 扩张利好与政策/产业匹配
+## 表八 · 扩张利好与政策/产业匹配
 | 公司 | 重大利好（融资/上市/并购/扩产/技术突破/中标） | 时间 | 依据 | 对招聘规模的影响（是否真在扩人） | 政策与产业匹配（国家/地方规划、扶持目录） | 上下游机会 |
 - 利好必须来自材料；没有就写「材料未见」——不得凭公司名气推断扩张
 - 政策匹配写清「哪份文件、哪一级、支持什么」；查不到写「材料未见（去哪查：发改委/工信部/省政府官网规划专栏）」
 
-## 表六 · 来源与检索命中清单
+## 表九 · 来源与检索命中清单
 | 编号 | 标题 | 平台 | 链接 | 是否含 JD 正文 | 备注 |
 链接必须从检索材料原样复制，绝不编造、不改写；材料无 url 写「引擎未返回链接」并改用平台直达链接。
 
-规则：① 只输出表格，表格外最多一行说明；② 联系方式严守合规——只引用材料中**已公开招聘**的联系人称呼/邮箱/总机，**禁止任何个人手机号与推断号码**，没有就写「材料未公开」；③ 若材料只有公司/行业级信息、没有具体在招岗位：先在表一前用一行粗体写「本次检索未覆盖具体岗位」，再按公司填表并给站内检索指引；④ 不编造材料之外的在招信息；⑤ 铁律：不臆测、不补全，缺什么写什么。"""
+规则：① 只输出表格，表格外最多一行说明；② 联系方式严守合规——只引用材料中**已公开招聘**的联系人称呼/邮箱/总机，**禁止任何个人手机号与推断号码**，没有就写「材料未公开」；③ 不得编造材料之外的在招信息；④ 铁律：不臆测、不补全，缺什么写什么；⑤ **公司情报、行业新闻、招聘入口只能进表二/三/四，绝不能进表一。**"""
 
     r = await _llm_call(provider, [
         {"role": "system", "content": RADAR_SYSTEM},
@@ -1933,24 +2017,64 @@ async def direct_radar(req: DirectRadarRequest):
     if not r.get("ok"):
         return r
     body = r["content"]
-    rows = _extract_pool_rows(body)
-    _attach_scores(rows, _extract_score_map(body))
-    seen_keys = [f"{x.get('公司', '')}·{x.get('岗位', '')}" for x in rows]
+    # ---- 岗位真实性判定 + 岗位评分（确定性规则层，见 app/jobs.py）----
+    ctx = JobQueryContext(
+        regions=region_all,
+        keywords=kw_all,
+        industries=ind_all,
+        salary_min=req.salary_min,
+        salary_max=req.salary_max,
+        exp_years=req.exp_years,
+        job_type=req.job_type,
+        social_recruit=(req.job_type or "any") != "实习",
+    )
+    verdict = process_job_report(body, ctx, context)
+    pool_rows = verdict["pool"]
+    pending_rows = verdict["pending"]
+    watch_rows = verdict["watch"]
+    intel_rows = verdict["intel"]
+    stats = verdict["stats"]
+    # 公司监控评分挂在所有分类行上（公司层面），岗位评分由 jobs 写入 _score/_layer
+    company_scores = _extract_score_map(body)
+    for group in (pool_rows, pending_rows):
+        _attach_company_scores(group, company_scores)
+    seen_keys = [f"{x.get('公司', '')}·{x.get('岗位', '')}" for x in (pool_rows + pending_rows)]
     return {
         "ok": True,
         "content": disclaimer + body,
         "model": provider.model,
         "signals": sig,
         "diagnostics": diag,
+        # 具体岗位池：只有通过 7 项硬门槛的 verified 岗位
         "pool": {
-            "rows": len(rows),
+            "rows": len(pool_rows),
             "want": want,
             "batch": int(req.batch or 0),
             "paths": len(queries),
             "per_query": per_query,
             "seen": seen_keys,
-            "keys": [{"post": x.get("岗位", ""), "company": x.get("公司", "")} for x in rows],
-            "items": rows,   # 前端「机会池面板」用它渲染卡片/紧凑表格
+            "keys": [{"post": x.get("岗位", ""), "company": x.get("公司", "")} for x in pool_rows],
+            "items": pool_rows,
+        },
+        # 待核实岗位：有招聘迹象但缺关键字段（不进具体岗位池）
+        "pending_jobs": {
+            "rows": len(pending_rows),
+            "items": pending_rows,
+            "reasons": sorted({w for x in pending_rows for w in (x.get("_job_reasons") or [])})[:12],
+        },
+        # 目标公司监控：公司值得盯，但没有具体岗位证据
+        "company_watchlist": {"rows": len(watch_rows), "items": watch_rows},
+        # 行业情报：政策/新闻/扩产/融资等（与岗位无关）
+        "industry_intel": {"rows": len(intel_rows), "items": intel_rows},
+        # 判定统计（便于前端与排障直接看到"为什么是 0 条"）
+        "verification": {
+            "candidates": stats["candidates"],
+            "verified": stats["verified"],
+            "pending": stats["pending"],
+            "invalid": stats["invalid"],
+            "invalid_samples": [f"{x.get('公司', '')}·{x.get('岗位', '')}（{'；'.join((x.get('_job_reasons') or [])[:1])}）"
+                                for x in verdict["invalid"][:6]],
+            "rule": "具体岗位需同时满足：岗位名具体 / 公司明确 / 地区明确且匹配 / 有真实JD / 来源平台可识别 / 有真实链接 / 非推测情报",
         },
     }
 
